@@ -60,7 +60,12 @@ static const std::vector<const char*> default_so_paths = {
 #elif defined(_WIN32)
 static const std::vector<const TCHAR*> default_so_paths = {__TEXT("OpenCL.dll")};
 #elif defined(__linux__)
+// The unversioned "libOpenCL.so" symlink ships in the OpenCL *development*
+// package, which is absent on hosts that only install a vendor runtime (for
+// example Intel's compute runtime on Ubuntu provides just libOpenCL.so.1).
+// Fall back to the versioned soname so those hosts work without an SDK.
 static const std::vector<const char*> default_so_paths = {"libOpenCL.so",
+                                                          "libOpenCL.so.1",
                                                           "/usr/lib/libOpenCL.so",
                                                           "/usr/local/lib/libOpenCL.so",
                                                           "/usr/local/lib/libpocl.so",
