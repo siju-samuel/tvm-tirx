@@ -831,11 +831,23 @@ class ThreadAllreduceBuilder final : public StmtExprMutator {
   bool IsWarpReduction(const std::vector<PrimType>& dtypes, int group_extent, int reduce_extent,
                        int contiguous_reduce_extent) {
     if ((target_->kind->name != "cuda") && (target_->kind->name != "rocm") &&
-        (target_->kind->name != "metal") && (target_->kind->name != "webgpu")) {
+        (target_->kind->name != "metal") && (target_->kind->name != "webgpu") &&
+        (target_->kind->name != "opencl")) {
       return false;
     }
 
-    need_warp_shuffle_mask_ = target_->kind->name != "metal" && target_->kind->name != "webgpu";
+    // The opencl kind defaults thread_warp_size to 1, which means "sub-group width unknown" rather
+    // than "one lane wide" -- OpenCL has no portable way to query it, so only a target that states
+    // its width (see the intel/* tags) can take the shuffle path.  Leaving the default alone keeps
+    // every other OpenCL target on the shared-memory reduction it uses today.
+    if (target_->kind->name == "opencl" && warp_size_ <= 1) {
+      return false;
+    }
+
+    // Metal, WebGPU and OpenCL sub-groups have no activemask equivalent to thread through the
+    // shuffles.
+    need_warp_shuffle_mask_ = target_->kind->name != "metal" && target_->kind->name != "webgpu" &&
+                              target_->kind->name != "opencl";
 
     // rocm only supports 32 bit operands for shuffling at the moment
     if ((target_->kind->name == "rocm") &&

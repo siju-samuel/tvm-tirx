@@ -159,10 +159,16 @@ ffi::Any OpenCLWorkspace::GetAttr(Device dev, const ffi::String& name) {
     return static_cast<int64_t>(value);
   }
   if (name == "warp_size") {
-    /* TODO: the warp size of OpenCL device is not always 1
-             e.g. Intel Graphics has a sub group concept which contains 8 - 32 work items,
-             corresponding to the number of SIMD entries the heardware configures.
-             We need to figure out a way to query this information from the hardware.
+    /* The real sub-group width is queryable on some implementations -- Intel exposes
+       CL_DEVICE_SUB_GROUP_SIZES_INTEL, and OpenCL 2.1 has clGetKernelSubGroupInfo -- but reporting
+       it here would do the wrong thing.  Target::FromDevice maps this query onto the target's
+       thread_warp_size (see the rename in target.cc), and a thread_warp_size above 1 is what makes
+       LowerThreadAllreduce emit sub-group shuffles.  Those lower to intel_sub_group_* builtins,
+       which only exist on Intel implementations, so answering truthfully here would break every
+       other OpenCL vendor.
+
+       A target that wants the sub-group path therefore has to say so explicitly, which is what the
+       intel/* target tags do.  TVM_OPENCL_WARP_SIZE remains available for experiments.
     */
     const int warp_size = support::GetEnv("TVM_OPENCL_WARP_SIZE", 1);
     return warp_size;
