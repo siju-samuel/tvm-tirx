@@ -64,6 +64,20 @@ class CodeGenOpenCL final : public CodeGenC {
                          const PrimType& target) final;                         // NOLINT(*)
   std::string CastTo(std::string value, const PrimType& target);                // NOLINT(*)
   void SetTextureScope(const std::unordered_map<const VarObj*, std::string>&);  // NOLINT(*)
+  /*!
+   * \brief Pin the sub-group width that generated sub-group builtins assume.
+   *
+   * OpenCL leaves the sub-group size to the implementation, so a kernel using sub-group shuffles or
+   * barriers has to state the width it was lowered for.  A value of 0 leaves it unstated, which is
+   * the only correct choice for a target that does not declare thread_warp_size.
+   */
+  void SetRequiredSubGroupSize(int size) {
+    required_sub_group_size_ = size;
+    // A kernel is only given a width because it uses sub-group builtins, and those need the
+    // extension enabled.  Setting this here rather than where the builtins are printed also covers
+    // kernels whose only sub-group use is a shuffle, which never reaches PrintStorageSync.
+    enable_subgroups_ = size > 0;
+  }
 
   // overload visitor
   void Dispatch_(const BindObj* op) final;
@@ -91,6 +105,10 @@ class CodeGenOpenCL final : public CodeGenC {
   // Whether to enable sampler or sampler-less texture reads,
   // where the choice depends on the OpenCL version used.
   bool enable_compliant_texture_reads_{false};
+  // Whether this kernel uses sub-group builtins and so needs the sub-group extension enabled.
+  bool enable_subgroups_{false};
+  // Sub-group width the generated sub-group builtins assume; 0 leaves it unstated.
+  int required_sub_group_size_{0};
   // Mapping from buffer to allocation size.
   // Useful to track when a scalar store of a vectorized texture load is required.
   std::unordered_map<const ffi::Object*, size_t> allocation_size_;

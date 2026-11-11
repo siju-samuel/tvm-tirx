@@ -28,6 +28,8 @@
 #include <tvm/ir/function.h>
 #include <tvm/runtime/memory_scope.h>
 #include <tvm/support/gpu_thread_tag.h>
+#include <tvm/tirx/op/abi.h>
+#include <tvm/tirx/op/gpu.h>
 #include <tvm/tirx/op/memory.h>
 
 #include <cmath>
@@ -148,7 +150,15 @@ void CodeGenOpenCL::InitFuncState(const Function& f) {
   }
 }
 
-void CodeGenOpenCL::PrintFuncPrefix(std::ostream& os) { os << "__kernel "; }
+void CodeGenOpenCL::PrintFuncPrefix(std::ostream& os) {
+  if (required_sub_group_size_ > 0) {
+    // OpenCL picks the sub-group size itself, but the sub-group shuffles and barriers in this
+    // kernel were lowered for a specific width.  Pin it so the two agree; without this IGC is free
+    // to choose another SIMD width and the reduction silently reduces across the wrong lanes.
+    os << "__attribute__((intel_reqd_sub_group_size(" << required_sub_group_size_ << ")))\n";
+  }
+  os << "__kernel ";
+}
 
 void CodeGenOpenCL::PreFunctionBody(const Function& f) {
   for (Var arg : f->params) {
@@ -182,6 +192,18 @@ std::string CodeGenOpenCL::Finish() {
                    "#else\n"
                    "#error \"Double precision floating point not supported"
                    " by OpenCL implementation on your device.\" \n"
+                   "#endif\n\n";
+  }
+
+  // Sub-group shuffles come from cl_intel_subgroups; sub_group_barrier is core in OpenCL 2.0 and
+  // comes from cl_khr_subgroups before that.  Enable both when present rather than requiring a
+  // particular OpenCL version.
+  if (enable_subgroups_) {
+    decl_stream << "#ifdef cl_khr_subgroups\n"
+                   "#pragma OPENCL EXTENSION cl_khr_subgroups : enable\n"
+                   "#endif\n"
+                   "#ifdef cl_intel_subgroups\n"
+                   "#pragma OPENCL EXTENSION cl_intel_subgroups : enable\n"
                    "#endif\n\n";
   }
 
@@ -405,7 +427,25 @@ void CodeGenOpenCL::PrintStorageSync(const CallObj* op) {
   const std::string& sync = op->args[0].as<StringImmObj>()->value;
   if (sync == "warp") {
     this->PrintIndent();
-    this->stream << "barrier(CLK_LOCAL_MEM_FENCE);\n";
+    if (required_sub_group_size_ > 0) {
+      // A memory fence, not a barrier of any scope.  The only thing that emits warp-scoped
+      // synchronization is the in-warp tail of LowerThreadAllreduce, which needs the load and the
+      // store on either side of it ordered rather than the work-items synchronized -- and it sits
+      // inside divergent control flow on purpose, to keep the divergence short.  OpenCL requires
+      // every work-item of the work-group to reach a barrier() and every work-item of the
+      // sub-group to reach a sub_group_barrier(), so either one is undefined in that position.
+      //
+      // A fence supplies the ordering without the control synchronization.  What makes that
+      // sufficient is that the tail only ever reduces within one sub-group, whose lanes advance in
+      // lockstep -- the same property the CUDA backend relies on when it emits nothing here at all.
+      // The lockstep argument is why the sub-group width has to be pinned; see PrintFuncPrefix.
+      this->stream << "mem_fence(CLK_LOCAL_MEM_FENCE);\n";
+    } else {
+      // Targets that do not declare a sub-group width never reach the divergent in-warp tail, since
+      // LowerThreadAllreduce keeps them on the shared-memory reduction.  Preserve the work-group
+      // barrier they have always been given.
+      this->stream << "barrier(CLK_LOCAL_MEM_FENCE);\n";
+    }
   } else if (sync == "shared") {
     this->PrintIndent();
     this->stream << "barrier(CLK_LOCAL_MEM_FENCE);\n";
@@ -770,8 +810,57 @@ void CodeGenOpenCL::SetTextureScope(
   }
 }
 
+namespace {
+
+/*!
+ * \brief Whether a kernel body contains anything lowered to an OpenCL sub-group builtin.
+ *
+ * LowerIntrin has already rewritten the warp shuffles into extern calls by the time codegen runs,
+ * so those are matched by name; warp-scoped synchronization still arrives as a storage sync.  The
+ * tirx warp ops are matched too so the answer does not depend on pass ordering.
+ */
+class UsesSubGroups : public StmtExprVisitor {
+ public:
+  UsesSubGroups() {}
+
+  bool Check(const Stmt& body) {
+    found_ = false;
+    StmtExprVisitor::Visit(body);
+    return found_;
+  }
+
+  ffi::Optional<VisitInterrupt> Visit_(const CallObj* op) final {
+    if (op->op.same_as(tirx::gpu_storage_sync_op())) {
+      if (const auto* scope = op->args[0].as<StringImmObj>(); scope && scope->value == "warp") {
+        found_ = true;
+      }
+    } else if (op->op.same_as(tirx::call_extern_op()) ||
+               op->op.same_as(tirx::call_pure_extern_op())) {
+      if (const auto* name = op->args[0].as<StringImmObj>();
+          name && name->value.find("sub_group") != std::string::npos) {
+        found_ = true;
+      }
+    } else if (op->op.same_as(tirx::gpu_warp_shuffle_op()) ||
+               op->op.same_as(tirx::gpu_warp_shuffle_up_op()) ||
+               op->op.same_as(tirx::gpu_warp_shuffle_down_op()) ||
+               op->op.same_as(tirx::gpu_warp_shuffle_xor_op())) {
+      found_ = true;
+    }
+    return StmtExprVisitor::Visit_(op);
+  }
+
+ private:
+  bool found_{false};
+};
+
+}  // namespace
+
 ffi::Module BuildOpenCL(IRModule mod, Target target) {
   bool output_ssa = false;
+
+  // Only a target that states its sub-group width can have been lowered to sub-group builtins; the
+  // opencl default of 1 means the width is unknown.  See LowerThreadAllreduce.
+  int64_t warp_size = target->GetAttr<int64_t>("thread_warp_size", 1).value();
 
   ffi::Map<GlobalVar, Function> functions;
   for (auto [gvar, base_func] : mod->functions) {
@@ -794,6 +883,16 @@ ffi::Module BuildOpenCL(IRModule mod, Target target) {
     cg.Init(output_ssa);
     for (auto [other_gvar, other_function] : functions) {
       cg.DeclareFunction(other_gvar, other_function);
+    }
+    // Pin the sub-group width only for kernels that actually use sub-group builtins.  An
+    // intel_reqd_sub_group_size attribute constrains the work-group sizes a kernel can be enqueued
+    // with, so it must not be attached to kernels that gain nothing from it.
+    //
+    // Set after the forward declarations above so the attribute lands on the definition alone.  The
+    // generated sources are concatenated into a single program, so a declaration carrying a width
+    // that the matching definition elsewhere in that program does not would be contradictory.
+    if (warp_size > 1 && ffi::make_object<UsesSubGroups>()->Check(function->body)) {
+      cg.SetRequiredSubGroupSize(static_cast<int>(warp_size));
     }
     cg.AddFunction(gvar, function);
     std::string fsource = cg.Finish();
