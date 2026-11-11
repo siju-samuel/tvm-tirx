@@ -34,6 +34,7 @@ _BUILTIN_BACKENDS = (
     "webgpu",
     "hexagon",
     "adreno",
+    "intel",
     "rust",
 )
 
