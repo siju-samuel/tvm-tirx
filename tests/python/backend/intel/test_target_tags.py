@@ -42,12 +42,12 @@ def test_intel_tag_reports_device_limits():
     assert target.attrs["max_threads_per_block"] > stock.attrs["max_threads_per_block"]
 
 
-def test_intel_tag_keeps_default_warp_size():
-    """Declaring the hardware sub-group size (16) would push LowerThreadAllreduce
-    into its in-warp tail, which emits a work-group barrier inside divergent
-    control flow -- undefined behavior in OpenCL.  See target_tags docstring."""
-    assert Target("intel/arc-b60-opencl").attrs["thread_warp_size"] == 1
-    assert Target("intel/xe-opencl").attrs["thread_warp_size"] == 1
+def test_intel_tag_declares_sub_group_width():
+    """thread_warp_size above 1 is what puts reductions on sub-group shuffles; the
+    stock opencl default of 1 means "width unknown"."""
+    assert Target("intel/arc-b60-opencl").attrs["thread_warp_size"] == 16
+    assert Target("intel/xe-opencl").attrs["thread_warp_size"] == 16
+    assert Target("opencl").attrs["thread_warp_size"] == 1
 
 
 def test_intel_backend_is_autoloaded():

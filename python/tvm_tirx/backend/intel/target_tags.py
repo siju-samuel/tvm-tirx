@@ -22,22 +22,28 @@ defaults are tuned for mobile parts -- 16 KiB of shared memory and 256 threads
 per block -- which badly under-describes a discrete Xe part, so these tags carry
 the real device limits.
 
-``thread_warp_size`` is deliberately left at the ``opencl`` default of 1, even
-though Xe parts report sub-groups of 16 and 32.  Declaring the hardware value
-today produces OpenCL C that is undefined behavior: ``LowerThreadAllreduce``
-switches to its in-warp tail when ``reduce_align <= thread_warp_size``, and that
-tail emits ``SyncThread("warp")`` inside a divergent ``if (tid < n)`` region,
-which ``CodeGenOpenCL::PrintStorageSync`` lowers to a work-group
-``barrier(CLK_LOCAL_MEM_FENCE)``.  A work-group barrier in divergent control flow
-is undefined in OpenCL; it happens to compute the right answer on Battlemage but
-must not be relied on.  Raising this value requires the OpenCL code generator to
-first emit an ``intel_reqd_sub_group_size`` attribute and lower warp-level
-synchronization and reductions to sub-group builtins.
+``thread_warp_size`` is 16, the SIMD width Xe parts use for compute.  Declaring
+it is what puts reductions on ``sub_group_reduce``-style shuffles instead of a
+shared-local-memory tree: ``LowerThreadAllreduce`` only takes its warp path for a
+target whose ``thread_warp_size`` exceeds 1, and ``CodeGenOpenCL`` only pins
+``intel_reqd_sub_group_size`` and emits ``sub_group_barrier`` for such a target.
+Leaving it at the ``opencl`` default of 1 means "width unknown" and keeps the
+shared-memory reduction.
+
+Xe parts also support sub-groups of 8 and 32.  16 is chosen because it is the
+width IGC picks for compute kernels by default, so pinning it with
+``intel_reqd_sub_group_size`` agrees with what the hardware would have done
+anyway.  The value has to be declared rather than queried: it is baked into the
+generated code at compile time, while the device query in
+``opencl_device_api.cc`` reports what the driver offers at run time.
 """
 
 from __future__ import annotations
 
 from tvm_tirx.target import register_tag
+
+# SIMD width Xe parts use for compute kernels.  See the module docstring.
+_XE_SUB_GROUP_SIZE = 16
 
 
 def _register_intel_opencl_tag(name: str, *, max_threads: int, shared_mem: int) -> None:
@@ -50,6 +56,7 @@ def _register_intel_opencl_tag(name: str, *, max_threads: int, shared_mem: int) 
             "max_threads_per_block": max_threads,
             "max_num_threads": max_threads,
             "max_shared_memory_per_block": shared_mem,
+            "thread_warp_size": _XE_SUB_GROUP_SIZE,
         },
     )
 

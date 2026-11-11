@@ -26,6 +26,11 @@ from tvm_tirx.script import tirx as T
 from tvm_tirx.testing import env
 
 
+# A Target rather than a tag string, because device_enabled only resolves a
+# runtime from a bare kind name.
+_INTEL_OPENCL = tvm_tirx.target.Target("intel/arc-b60-opencl")
+
+
 def _reduce_module(d1, d2, d3, is_max=False):
     combine = T.Lambda(
         [T.float32, T.float32],
@@ -83,6 +88,10 @@ def dims(request):
     [
         pytest.param("cuda", marks=pytest.mark.gpu),
         pytest.param("metal", marks=pytest.mark.gpu),
+        # Both OpenCL paths: the stock kind reduces through shared local memory,
+        # while a target declaring a sub-group width reduces through shuffles.
+        pytest.param("opencl", marks=pytest.mark.gpu),
+        pytest.param(_INTEL_OPENCL, marks=pytest.mark.gpu),
     ],
 )
 def test_allreduce_sum(dims, target):
@@ -152,6 +161,10 @@ def test_allreduce_sum_compile(optional_metal_compile_callback):
     [
         pytest.param("cuda", marks=pytest.mark.gpu),
         pytest.param("metal", marks=pytest.mark.gpu),
+        # Both OpenCL paths: the stock kind reduces through shared local memory,
+        # while a target declaring a sub-group width reduces through shuffles.
+        pytest.param("opencl", marks=pytest.mark.gpu),
+        pytest.param(_INTEL_OPENCL, marks=pytest.mark.gpu),
     ],
 )
 def test_allreduce_max(dims, target):

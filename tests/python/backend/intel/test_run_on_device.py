@@ -71,8 +71,8 @@ def test_add_one():
 @pytest.mark.gpu
 @requires_intel_gpu
 def test_crossthread_reduction():
-    """Exercises shared local memory and barriers: the reduction lowers to a
-    ``__local`` tree reduction because the OpenCL backend has no sub-group path."""
+    """A reduction wider than one sub-group: each sub-group reduces with shuffles,
+    then the per-sub-group results meet through a ``__local`` staging buffer."""
     import numpy as np
 
     nthd = 64
@@ -113,6 +113,57 @@ def test_crossthread_reduction():
         b = tvm_tirx.runtime.tensor(np.zeros((rows,), dtype="float32"), dev)
         fun["main"](a, b)
         np.testing.assert_allclose(b.numpy(), a_np.sum(axis=1), rtol=1e-4, atol=1e-4)
+
+    tvm_tirx.testing.run_with_gpu_lock(run_and_check)
+
+
+@pytest.mark.gpu
+@requires_intel_gpu
+@pytest.mark.parametrize("nthd", [16, 8])
+def test_subgroup_reduction_values(nthd):
+    """A reduction that fits inside one sub-group, so the whole tree is shuffles
+    with no shared memory and no barrier.  Checks the values, because a shuffle
+    tree that reduces across the wrong lanes still produces plausible numbers.
+
+    ``nthd=8`` covers the sub-warp case, where two reducing groups share a
+    sub-group and each must keep to its own half.
+    """
+    import numpy as np
+
+    rows = 64
+
+    @I.ir_module
+    class Module:
+        @T.function
+        def main(A: T.Tensor((rows, nthd), "float32"), B: T.Tensor((rows,), "float32")):
+            T.func_attr({"tirx.noalias": True})
+            with T.launch_thread("blockIdx.x", rows) as i:
+                with T.launch_thread("threadIdx.x", nthd) as k:
+                    partial = T.alloc_tensor(ty_args=[T.Tensor((1,), "float32", scope="local")])
+                    reduced = T.alloc_tensor(ty_args=[T.Tensor((1,), "float32", scope="local")])
+                    partial[0] = A[i, k]
+                    T.gpu_thread_allreduce(
+                        T.Lambda([T.float32, T.float32], lambda x, y: (x + y,)),
+                        (T.float32(0),),
+                        (partial[0],),
+                        True,
+                        (reduced[0],),
+                        (k,),
+                    )
+                    if k == 0:
+                        B[i] = reduced[0]
+
+    fun = tvm_tirx.compile(Module, target=TARGET)
+    # Distinct per-lane magnitudes, so a reduction that picks up the wrong lanes
+    # cannot coincidentally produce the right sum.
+    a_np = (np.arange(rows * nthd, dtype="float32") + 1.0).reshape(rows, nthd)
+
+    def run_and_check():
+        dev = tvm_tirx.opencl(0)
+        a = tvm_tirx.runtime.tensor(a_np, dev)
+        b = tvm_tirx.runtime.tensor(np.zeros((rows,), dtype="float32"), dev)
+        fun["main"](a, b)
+        np.testing.assert_allclose(b.numpy(), a_np.sum(axis=1), rtol=1e-5)
 
     tvm_tirx.testing.run_with_gpu_lock(run_and_check)
 
