@@ -201,7 +201,66 @@ OpenCL execution analysis yet, so this is not checked either: call it in
 sub-group-uniform control flow, in a work-group whose x extent is a multiple
 of 16.
 
-The example loads fragments with scalar loads, which is enough to check
-correctness but leaves the XMX engines underfed. The 2D block reads in
-``cl_intel_subgroup_2d_block_io`` load a whole fragment per instruction and are
-the next step for performance.
+Loading Fragments with 2D Block Reads
+-------------------------------------
+
+Scalar loads are enough to check correctness but leave the XMX engines
+underfed: a ``32 x 32`` tile issues 64 loads per work-item for every 8 matrix
+instructions. The 2D block reads of ``cl_intel_subgroup_2d_block_io`` move a
+whole block per instruction, and they produce exactly the fragments DPAS reads,
+so the same register views pass from one instruction to the next.
+
+``T.opencl.tile.block_read(instruction, dst, src, scope="subgroup")`` reads a
+region of a row-major global matrix. The region is tiled into the instruction's
+blocks, and the register operand has one atom per block, with repeat axes over
+the row and column blocks. ``block_write`` stores registers back, with the
+global region first. A sub-group's main loop then reads its ``A`` rows and
+``B`` columns, multiplies, and finally writes its ``C`` tile:
+
+.. code-block:: python
+
+    for kb in range(K // 16):
+        T.opencl.tile.block_read(
+            "intel_sub_group_2d_block_read_16b_8r16x1c",
+            ar.view(4, 1, 8, 16, layout=fragment(4, 1, 8)),
+            A[row0 : row0 + 32, kb * 16 : kb * 16 + 16],
+            scope="subgroup",
+        )
+        T.opencl.tile.block_read(
+            "intel_sub_group_2d_block_read_transform_16b_16r16x1c",
+            br.view(T.uint32.dtype).view(1, 2, 8, 16, layout=fragment(1, 2, 8)),
+            B[kb * 16 : kb * 16 + 16, col0 : col0 + 32],
+            scope="subgroup",
+        )
+        T.opencl.tile.dpas(
+            "intel_sub_group_f16_f16_matrix_mad_k16",
+            dr.view(4, 2, 8, 16, layout=fragment(4, 2, 8)),
+            ar.view(4, 1, 8, 16, layout=fragment(4, 1, 8)),
+            br.view(T.uint32.dtype).view(1, 2, 8, 16, layout=fragment(1, 2, 8)),
+            dr.view(4, 2, 8, 16, layout=fragment(4, 2, 8)),
+            scope="subgroup",
+        )
+    T.opencl.tile.block_write(
+        "intel_sub_group_2d_block_write_32b_8r16x1c",
+        C[row0 : row0 + 32, col0 : col0 + 32],
+        dr.view(4, 2, 8, 16, layout=fragment(4, 2, 8)),
+        scope="subgroup",
+    )
+
+The plain read produces the ``A`` fragment, and the ``transform`` read packs
+K-adjacent rows into the VNNI words ``B`` needs, in hardware. Each read and write
+variant was checked on an Arc Pro B60 and lowering accepts no others; the
+:doc:`reference </reference/python/backend.intel.tile.block_io>` lists them.
+
+Two surface parameters silently return wrong data when violated, so lowering
+must prove both: the matrix's row pitch is a multiple of 16 bytes, and each
+block's x offset is 4-byte aligned. Reads outside the matrix return zero and
+writes outside it are dropped, so edge tiles need no masking.
+
+On an Arc Pro B60, this kernel with ``4 x 4`` sub-groups per work-group computes
+a ``2048``\ :sup:`3` float16 product at 64--67 TFLOP/s, against 8.6 TFLOP/s
+with scalar fragment loads and 2.0 TFLOP/s for a scalar-FMA kernel. These are
+medians over interleaved runs; a single run on a shared machine can read far
+lower while the clocks ramp up. Larger sub-group tiles exhaust the default
+register file and spill, which a later change can address with the driver's
+256-register mode.

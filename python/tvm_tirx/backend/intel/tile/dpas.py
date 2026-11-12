@@ -57,14 +57,15 @@ reductions lower to on this target.
 
 from itertools import product
 
-from tvm_tirx.ir import Bind, Range, SeqStmt, TensorRegion, TensorStore, Var
-from tvm_tirx.ir.prim import Broadcast, Cast, Or, Ramp
-from tvm_tirx.runtime import MemoryScope
+from tvm_tirx.ir import SeqStmt, TensorRegion
+from tvm_tirx.ir.prim import Broadcast, Cast
 from tvm_tirx.script import tirx as T
-from tvm_tirx.sym import Analyzer, ConstraintContext, RangeConstraint
+from tvm_tirx.sym import Analyzer
 from tvm_tirx.tirx.tile.instruction import Instruction, Operand
 
-SUB_GROUP_SIZE = 16
+from ._publish import publish
+from .fragment import Fragment, check_disjoint, require_intel_target, vector_type
+
 M_CHOICES = (1, 2, 4, 8)
 B_WORDS = 8  # 32-bit words of B per work-item: K * bits(element) / 32.
 
@@ -84,142 +85,13 @@ FAMILIES = {
 }
 
 
-def _vector(dtype, lanes):
-    return dtype if lanes == 1 else f"{dtype}x{lanes}"
-
-
-class _Fragment:
-    """One register operand, checked against the atom's work-item mapping."""
-
-    def __init__(self, name, region, atom_rows, analyzer, layout_analyzer):
-        if not isinstance(region, TensorRegion):
-            raise TypeError(f"{name}: expected a register tensor region")
-        self.name, self.region = name, region
-        self.tensor, self.ty = region.source, region.source.ty
-        self.dtype = str(self.ty.dtype.dtype)
-        self.analyzer, self.layout_analyzer = analyzer, layout_analyzer
-        if self.ty.scope != MemoryScope("local"):
-            raise ValueError(f"{name}: fragments must be in registers, got {self.ty.scope}")
-        self.layout = self.ty.effective_layout()
-        if self.layout is None:
-            raise ValueError(f"{name}: operand requires a physical layout")
-        self.shape = tuple(int(analyzer.simplify(r.extent)) for r in region.region)
-        if len(self.shape) < 4 or self.shape[-2:] != (atom_rows, SUB_GROUP_SIZE):
-            raise ValueError(
-                f"{name}: expected (*batch, R0, R1, {atom_rows}, {SUB_GROUP_SIZE}), "
-                f"got {self.shape}"
-            )
-        for r, size in zip(region.region, self.ty.shape):
-            self._require(r.begin >= 0, "region start is out of bounds")
-            self._require(r.begin + r.extent <= size, "region exceeds the tensor shape")
-        self.rows = atom_rows
-        self.raw = None
-
-    @property
-    def repeats(self):
-        return self.shape[:-2]
-
-    def require_bits(self, bits, what):
-        dtype = self.ty.dtype.dtype
-        if dtype.bits != bits or dtype.lanes != 1:
-            raise ValueError(
-                f"{self.name}: expected scalar {bits}-bit {what}, got {self.dtype}; "
-                "pack elements with an explicit dtype view"
-            )
-
-    def _require(self, condition, message):
-        if not self.analyzer.can_prove(condition):
-            raise ValueError(f"{self.name}: {message}: cannot prove {condition}")
-
-    def _physical(self, coords):
-        indices = [self.analyzer.simplify(r.begin + i) for r, i in zip(self.region.region, coords)]
-        result = self.layout.apply(*indices, shape=self.ty.shape, analyzer=self.layout_analyzer)
-        return {key: self.analyzer.simplify(value) for key, value in dict(result).items()}
-
-    def base(self, repeat):
-        """Check one repeat's atom against the hardware mapping; return its storage base.
-
-        Work-item ``lane`` and component ``row`` are symbolic over the whole atom,
-        so the proof covers every position at once rather than sampling them.
-        """
-        lane, row = Var("dpas_lane", "int32"), Var("dpas_row", "int32")
-        constraints = ConstraintContext()
-        constraints.append(RangeConstraint(lane, Range(0, SUB_GROUP_SIZE)))
-        constraints.append(RangeConstraint(row, Range(0, self.rows)))
-        self.analyzer.sync_constraint_context(constraints)
-        try:
-            physical = self._physical((*repeat, row, lane))
-            for axis in set(physical) - {"m", "sglid"}:
-                self._require(
-                    physical[axis] == 0, f"atom places values on unexpected axis {axis!r}"
-                )
-            self._require(
-                physical.get("sglid", 0) == lane,
-                "atom column must be the work-item index within the sub-group (sglid)",
-            )
-            origin = self._physical((*repeat, 0, 0)).get("m", 0)
-            self._require(
-                physical.get("m", 0) == origin + row,
-                "each work-item's atom must occupy consecutive registers in row order",
-            )
-        finally:
-            self.analyzer.sync_constraint_context(ConstraintContext())
-        return origin
-
-    def storage(self, bindings):
-        """A flat alias of the operand's registers, addressed by storage offset."""
-        if self.raw is None:
-            span = self.layout.span("m")
-            self.raw = Var(
-                "dpas_" + self.name,
-                T.Tensor((span,), self.dtype, scope="local", layout="default"),
-            )
-            bindings.append(Bind(self.raw, T.decl_tensor(self.tensor.data, ty_args=[self.raw.ty])))
-        return self.raw
-
-    def load(self, bindings, base, as_dtype):
-        raw = self.storage(bindings)
-        value = raw[base] if self.rows == 1 else raw[Ramp(base, 1, self.rows)]
-        target = _vector(as_dtype, self.rows)
-        return value if self.dtype == as_dtype else T.reinterpret(value, ty=target)
-
-    def store(self, bindings, base, value):
-        raw = self.storage(bindings)
-        index = base if self.rows == 1 else Ramp(base, 1, self.rows)
-        return TensorStore(raw, [index], value)
-
-
-def _require_intel_target(target):
-    keys = {str(key) for key in target.keys}
-    if "intel" not in keys:
-        raise ValueError(
-            "dpas requires an Intel OpenCL target, such as intel/arc-b60-opencl; "
-            f"got keys {sorted(keys)}"
-        )
-    warp = int(target.attrs["thread_warp_size"])
-    if warp != SUB_GROUP_SIZE:
-        raise ValueError(
-            f"dpas requires a sub-group size of {SUB_GROUP_SIZE}, "
-            f"but the target declares thread_warp_size={warp}"
-        )
-
-
-def _check_disjoint(analyzer, bases, width, name):
-    """Distinct repeats must write distinct registers, or one result overwrites another."""
-    for i, first in enumerate(bases):
-        for second in bases[i + 1 :]:
-            apart = Or(first - second >= width, second - first >= width)
-            if not analyzer.can_prove(apart):
-                raise ValueError(f"{name}: two repeats of the accumulator share registers")
-
-
 def lower(view, sctx):
     """Check the operands of one ``dpas`` call and emit its builtin calls."""
     instruction, d, a, b, c = view.args
     name = instruction.value if hasattr(instruction, "value") else str(instruction)
     if name not in FAMILIES:
         raise ValueError(f"Unknown dpas instruction {name!r}; expected one of {sorted(FAMILIES)}")
-    _require_intel_target(sctx.target)
+    require_intel_target(sctx.target, "dpas")
     a_word, b_word, accumulators = FAMILIES[name]
 
     analyzer, layout_analyzer = Analyzer(), Analyzer()
@@ -229,10 +101,10 @@ def lower(view, sctx):
     if m not in M_CHOICES:
         raise ValueError(f"D: atom row count must be one of {M_CHOICES}, got {m}")
 
-    df = _Fragment("D", d, m, analyzer, layout_analyzer)
-    af = _Fragment("A", a, m, analyzer, layout_analyzer)
-    bf = _Fragment("B", b, B_WORDS, analyzer, layout_analyzer)
-    cf = _Fragment("C", c, m, analyzer, layout_analyzer) if isinstance(c, TensorRegion) else None
+    df = Fragment("D", d, m, analyzer, layout_analyzer)
+    af = Fragment("A", a, m, analyzer, layout_analyzer)
+    bf = Fragment("B", b, B_WORDS, analyzer, layout_analyzer)
+    cf = Fragment("C", c, m, analyzer, layout_analyzer) if isinstance(c, TensorRegion) else None
 
     accumulator = df.dtype
     if accumulator not in accumulators:
@@ -257,7 +129,7 @@ def lower(view, sctx):
     d_bases = {
         (*bi, i, j): df.base((*bi, i, j)) for bi in batches for i in range(mr) for j in range(nr)
     }
-    _check_disjoint(analyzer, list(d_bases.values()), m, "D")
+    check_disjoint(analyzer, list(d_bases.values()), m, "D")
     c_bases = {key: cf.base(key) for key in d_bases} if cf is not None else None
     a_bases = {
         (*bi, i, k): af.base((*bi, i, k)) for bi in batches for i in range(mr) for k in range(kr)
@@ -267,7 +139,7 @@ def lower(view, sctx):
     }
 
     bindings, body = [], []
-    acc_ty = _vector(accumulator, m)
+    acc_ty = vector_type(accumulator, m)
     for (*bi, i, j), d_base in d_bases.items():
         for k in range(kr):
             if k > 0:
@@ -302,27 +174,4 @@ _construct = Instruction(
 ).register()
 
 
-def _publish(factory):
-    """Bind the instruction's own constructor where ``T.opencl.tile.dpas`` resolves.
-
-    Registering an instruction also exposes a generic op constructor under its
-    name, and that one hands ``scope="subgroup"`` to the scope enum unqualified.
-    The instruction's factory qualifies it to ``opencl.subgroup`` and validates
-    the operands, so install it in both exposure destinations: the backend module
-    takes the raw factory, the script namespace the auto-emitting one its other
-    ops use.  Exposure keeps an existing callable, so later republishing does not
-    replace it.
-    """
-    from importlib import import_module  # pylint: disable=import-outside-toplevel
-
-    from tvm_tirx.script.ir_builder.base import auto_emit_void_call
-
-    for module_name, fn in (
-        ("tvm_tirx.backend.opencl", factory),
-        ("tvm_tirx.backend.opencl.script", auto_emit_void_call(factory)),
-    ):
-        tile = import_module(module_name).tile
-        tile.dpas = fn
-
-
-_publish(_construct)
+publish("dpas", _construct)
