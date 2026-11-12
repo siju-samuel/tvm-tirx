@@ -354,6 +354,8 @@ def test_registered_tirx_ops_use_dispatch_attributes():
         "tirx.zero",
     }
 
+    # Tile instructions belong to the tile namespace of the target kind they run on.
+    backend_tile_prefixes = ("tirx.cuda.tile.", "tirx.trn.tile.", "tirx.opencl.tile.")
     lingering_flat_tile = []
     for op_name in sorted(name for name in Op.list_op_names() if name.startswith("tirx.")):
         dispatcher = _op_attr(op_name, "FTileOpDispatch")
@@ -363,10 +365,10 @@ def test_registered_tirx_ops_use_dispatch_attributes():
 
         if dispatcher is not None:
             assert callable(dispatcher), op_name
-            if not op_name.startswith(("tirx.cuda.tile.", "tirx.trn.tile.")):
+            if not op_name.startswith(backend_tile_prefixes):
                 lingering_flat_tile.append(op_name)
         else:
-            assert not op_name.startswith(("tirx.cuda.tile.", "tirx.trn.tile.")), op_name
+            assert not op_name.startswith(backend_tile_prefixes), op_name
             if op_name.split(".")[1] in device_namespaces:
                 surface_name = op_name.removeprefix("tirx.")
                 if op_name.startswith("tirx.ptx."):
