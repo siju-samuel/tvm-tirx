@@ -21,6 +21,6 @@ target kind it runs on and Intel GPUs run through the ``opencl`` kind.  Each one
 checks that its target is an Intel part before lowering.
 """
 
-from . import dpas
+from . import block_io, dpas
 
-__all__ = ["dpas"]
+__all__ = ["block_io", "dpas"]
