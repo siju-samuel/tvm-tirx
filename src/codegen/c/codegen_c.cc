@@ -1315,7 +1315,9 @@ void CodeGenC::DispatchAllocTensor(const BindObj* op, const CallObj* buffer_call
   PrintStorageScope(scope, stream);
 
   PrintType(PrimType(dtype), stream);
-  stream << ' ' << vid << '[' << constant_size << "];\n";
+  stream << ' ' << vid << '[' << constant_size << ']';
+  PrintAllocAttributes(buffer_call->ty_args[0].as_or_throw<tirx::TensorType>(), stream);
+  stream << ";\n";
 
   RegisterHandleType(buffer.get(), PrimType(dtype));
   if (annotations->dict.count(tvm::tirx::attr::kVolatile.name)) {

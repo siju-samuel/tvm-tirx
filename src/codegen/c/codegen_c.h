@@ -235,6 +235,12 @@ class CodeGenC : public tvm::ExprFunctor<void(const Expr&, std::ostream&)>,
   virtual void BindThreadIndex(const PrimVar& var, const ffi::String& thread_tag);  // NOLINT(*)
   virtual void PrintStorageQualifier(const VarObj* var, std::ostream& os);
   virtual void PrintStorageScope(const runtime::MemoryScope& scope, std::ostream& os);  // NOLINT(*)
+  /*!
+   * \brief Print attributes that follow a stack array's declarator, before its semicolon.
+   * \param type The allocated tensor type.
+   * \param os The output stream.
+   */
+  virtual void PrintAllocAttributes(const tirx::TensorType& type, std::ostream& os) {}  // NOLINT(*)
   virtual void PrintStorageSync(const CallObj* op);                                     // NOLINT(*)
   // Binary vector op.
   virtual void PrintVecBinaryOp(const std::string& op, const PrimType& op_type, PrimExpr lhs,

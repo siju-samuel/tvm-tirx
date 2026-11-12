@@ -514,6 +514,20 @@ void CodeGenOpenCL::Dispatch_(const BindObj* op) {
   CodeGenC::Dispatch_(op);
 }
 
+void CodeGenOpenCL::PrintAllocAttributes(const tirx::TensorType& type, std::ostream& os) {
+  // OpenCL aligns a variable only to its own element type, but the IR records a data_alignment for
+  // every allocation and views of the storage rely on it: a uint32 view of a half array is read
+  // through a uint pointer, which OpenCL requires to be 4-byte aligned.  Without this the claim is
+  // unbacked and such an access is undefined -- typically harmless while the array stays in
+  // registers, but not once it spills.  State the alignment so the generated code keeps it.
+  static const auto scope_local = runtime::MemoryScope::Get("local");
+  static const auto scope_shared = runtime::MemoryScope::Get("shared");
+  if (type->scope != scope_local && type->scope != scope_shared) return;
+  if (type->data_alignment > static_cast<int>(type->dtype.StorageBytes())) {
+    os << " __attribute__((aligned(" << type->data_alignment << ")))";
+  }
+}
+
 void CodeGenOpenCL::DispatchAllocTensor(const BindObj* op, const CallObj* buffer_call) {
   tvm::Tuple shape = tvm::Tuple(buffer_call->ty_args[0].as_or_throw<tirx::TensorType>()->shape);
   DLDataType dtype = buffer_call->ty_args[0].as_or_throw<tirx::TensorType>()->dtype->dtype;
