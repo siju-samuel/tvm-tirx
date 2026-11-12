@@ -18,7 +18,7 @@
 
 from importlib import import_module
 
-_LAZY_SUBMODULES = {"target_tags"}
+_LAZY_SUBMODULES = {"target_tags", "tile"}
 
 
 def register_backend():
@@ -27,6 +27,8 @@ def register_backend():
 
     backend.load("opencl")
     import_module(f"{__name__}.target_tags")
+    # Registered after opencl, which owns the sub-group scope and layout axis these use.
+    import_module(f"{__name__}.tile")
 
 
 def __getattr__(name: str):
@@ -35,4 +37,4 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-__all__ = ["register_backend", "target_tags"]
+__all__ = ["register_backend", "target_tags", "tile"]

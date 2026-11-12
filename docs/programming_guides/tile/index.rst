@@ -59,3 +59,4 @@ Matrix Instructions
 
    warp_matrix
    blackwell_tensor_cores
+   intel_dpas
