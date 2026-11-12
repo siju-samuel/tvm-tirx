@@ -23,9 +23,11 @@
  */
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/function.h>
+#include <tvm/ffi/reflection/enum_def.h>
 #include <tvm/runtime/base.h>
 #include <tvm/target/target.h>
 #include <tvm/target/target_kind.h>
+#include <tvm/tirx/tile/thread_scope.h>
 
 #include "../memory_scope.h"
 
@@ -42,6 +44,16 @@ void RegisterOpenCLIntrinRules();
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   tvm::backend::opencl::RegisterMemoryScopes();
+  // Execution scopes for OpenCL tile instructions, outermost first.  Sub-groups are core OpenCL, so
+  // these carry no vendor assumption; an instruction that needs a particular vendor or sub-group
+  // width checks the target itself.
+  for (const auto& [name, rank] :
+       {std::pair{"kernel", -1}, {"workgroup", 0}, {"subgroup", 1}, {"thread", 2}}) {
+    auto qualified = tvm::ffi::String("opencl.") + name;
+    tvm::ffi::reflection::EnumDef<tvm::tirx::ThreadScopeObj>(qualified.c_str())
+        .set_attr(tvm::tirx::thread_scope_attr::kBackend, tvm::ffi::String("opencl"))
+        .set_attr(tvm::tirx::thread_scope_attr::kRank, rank);
+  }
   using namespace tvm;
   namespace refl = tvm::ffi::reflection;
 

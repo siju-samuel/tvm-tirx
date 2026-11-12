@@ -54,7 +54,9 @@ def register_backend():
     except (OSError, FileNotFoundError, RuntimeError):
         pass
     register_device_target_detector("opencl", _detect_target_from_device)
-    from . import script
+    from . import axis, script
+
+    axis.register()
 
     builder_op.register_script_namespace("opencl", script)
     return None

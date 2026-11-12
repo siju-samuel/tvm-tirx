@@ -167,6 +167,7 @@ file(GLOB CODEGEN_SRCS CONFIGURE_DEPENDS
   src/backend/metal/codegen/*.cc
   src/backend/metal/op/*.cc
   src/backend/opencl/codegen/*.cc
+  src/backend/opencl/layout/*.cc
   src/backend/opencl/op/*.cc
   src/backend/rocm/codegen/*.cc
   src/backend/trn/codegen/*.cc
