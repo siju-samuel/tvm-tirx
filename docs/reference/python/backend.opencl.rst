@@ -40,4 +40,6 @@ Namespaces
 .. toctree::
    :maxdepth: 1
 
+   backend.opencl.axis
    backend.opencl.script
+   backend.opencl.thread_scope
