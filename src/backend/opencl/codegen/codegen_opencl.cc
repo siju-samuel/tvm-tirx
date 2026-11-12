@@ -528,6 +528,14 @@ void CodeGenOpenCL::PrintAllocAttributes(const tirx::TensorType& type, std::ostr
   }
 }
 
+void CodeGenOpenCL::PrintVecConstructor(const PrimType& t, std::ostream& os) {  // NOLINT(*)
+  // OpenCL C spells a vector literal as a cast, `(int2)(x, y)`.  The C base prints the bare type,
+  // `int2(x, y)`, which is CUDA's constructor syntax and does not compile as OpenCL C.
+  os << '(';
+  PrintType(t, os);
+  os << ')';
+}
+
 void CodeGenOpenCL::DispatchAllocTensor(const BindObj* op, const CallObj* buffer_call) {
   tvm::Tuple shape = tvm::Tuple(buffer_call->ty_args[0].as_or_throw<tirx::TensorType>()->shape);
   DLDataType dtype = buffer_call->ty_args[0].as_or_throw<tirx::TensorType>()->dtype->dtype;
