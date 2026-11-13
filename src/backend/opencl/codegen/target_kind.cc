@@ -68,6 +68,9 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       // Qualcomm OpenCL runtimes may crash when the number of kernel arguments is too large.
       .def_option<int64_t>("max_function_args", refl::DefaultValue(128))
       .def_option<int64_t>("image_base_address_alignment", refl::DefaultValue(64))
+      // Options for the OpenCL compiler, passed to clBuildProgram when the runtime builds each
+      // kernel.  They are vendor-specific, so only a target that knows its device should set them.
+      .def_option<ffi::String>("build_options")
       .set_default_keys({"opencl", "gpu"});
   tvm::codegen::intrin::RegisterOpenCLIntrinRules();
   tvm::codegen::RegisterOpenCLCodegen();
