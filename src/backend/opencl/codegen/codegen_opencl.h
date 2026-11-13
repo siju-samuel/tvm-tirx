@@ -49,7 +49,8 @@ class CodeGenOpenCL final : public CodeGenC {
   void PrintStorageScope(const runtime::MemoryScope& scope, std::ostream& os) final;  // NOLINT(*)
   void PrintAllocAttributes(const tirx::TensorType& type, std::ostream& os) final;    // NOLINT(*)
   void PrintVecConstructor(const PrimType& t, std::ostream& os) final;                // NOLINT(*)
-  void PrintStorageSync(const CallObj* op) final;                                     // NOLINT(*)
+  void PrintLoopPragma(const ForObj* op) final;
+  void PrintStorageSync(const CallObj* op) final;  // NOLINT(*)
   using CodeGenC::PrintType;
   void PrintType(const PrimType& t, std::ostream& os) final;  // NOLINT(*)
   void PrintType(const Type& type, std::ostream& os) final;   // NOLINT(*)
