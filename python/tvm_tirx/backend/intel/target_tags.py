@@ -36,6 +36,14 @@ width IGC picks for compute kernels by default, so pinning it with
 anyway.  The value has to be declared rather than queried: it is baked into the
 generated code at compile time, while the device query in
 ``opencl_device_api.cc`` reports what the driver offers at run time.
+
+``build_options`` lets the compiler choose each kernel's register file.  Xe
+work-items have 128 registers by default or 256 in large-register mode, which
+halves how many threads a core keeps resident.  A kernel whose live state does
+not fit in 128 spills, and a large matrix tile then runs over 30x slower; but
+forcing 256 everywhere costs a kernel that fits a third of its speed.  IGC's
+automatic mode takes 256 only for a kernel that would otherwise spill, which
+on an Arc Pro B60 matched the faster fixed mode for both kinds of kernel.
 """
 
 from __future__ import annotations
@@ -44,6 +52,8 @@ from tvm_tirx.target import register_tag
 
 # SIMD width Xe parts use for compute kernels.  See the module docstring.
 _XE_SUB_GROUP_SIZE = 16
+# Let IGC pick 128 or 256 registers per kernel.  See the module docstring.
+_XE_BUILD_OPTIONS = "-cl-intel-enable-auto-large-GRF-mode"
 
 
 def _register_intel_opencl_tag(name: str, *, max_threads: int, shared_mem: int) -> None:
@@ -57,6 +67,7 @@ def _register_intel_opencl_tag(name: str, *, max_threads: int, shared_mem: int) 
             "max_num_threads": max_threads,
             "max_shared_memory_per_block": shared_mem,
             "thread_warp_size": _XE_SUB_GROUP_SIZE,
+            "build_options": _XE_BUILD_OPTIONS,
         },
     )
 
