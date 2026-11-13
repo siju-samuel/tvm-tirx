@@ -57,6 +57,14 @@ when violated, so lowering requires a proof of both: the row pitch must be a
 multiple of 16 bytes, and every block's x offset must be 4-byte aligned.  The
 tensor must be at least 4-byte aligned, which was the coarsest alignment tested.
 
+``T.opencl.tile.block_prefetch(instruction, src, scope="subgroup")`` takes the
+same global operand and pulls its blocks into cache without touching registers,
+so a later read of them hits.  ``prefetch_16b_{1,...,32}r16x{1,2}c`` and
+``prefetch_8b_{1,...,32}r32x{1,2}c`` are accepted, the ``x2c`` forms covering
+two blocks side by side.  How far ahead to prefetch is the caller's choice and
+matters: in an fp16 GEMM on the B60, prefetching the next K step gained 25% and
+prefetching two steps ahead lost about as much.
+
 As with the DPAS instruction, all 16 work-items of the sub-group must reach the
 call, which TIRx does not yet check on OpenCL.
 """
@@ -75,17 +83,23 @@ from ._publish import publish
 from .fragment import Fragment, check_disjoint, context_analyzer, require_intel_target
 
 _NAME = re.compile(
-    r"^intel_sub_group_2d_block_(read|read_transform|write)_(8|16|32)b_(\d+)r(\d+)x1c$"
+    r"^intel_sub_group_2d_block_(read|read_transform|write|prefetch)_(8|16|32)b_"
+    r"(\d+)r(\d+)x(\d+)c$"
 )
 
-# (kind, element bits) -> (rows the hardware was checked with, block columns).
+_ROWS = (1, 2, 4, 8, 16, 32)
+# (kind, element bits) -> (rows, block columns, blocks per instruction) the hardware
+# was checked with.  Prefetch is also checked at two blocks wide, which halves the
+# instructions a K step needs; the reads and writes are checked at one.
 VERIFIED = {
-    ("read", 16): ((1, 2, 4, 8, 16, 32), 16),
-    ("read", 8): ((1, 2, 4, 8, 16, 32), 32),
-    ("read_transform", 16): ((16, 32), 16),
-    ("read_transform", 8): ((32,), 16),
-    ("write", 32): ((1, 2, 4, 8), 16),
-    ("write", 16): ((1, 2, 4, 8), 16),
+    ("read", 16): (_ROWS, 16, (1,)),
+    ("read", 8): (_ROWS, 32, (1,)),
+    ("read_transform", 16): ((16, 32), 16, (1,)),
+    ("read_transform", 8): ((32,), 16, (1,)),
+    ("write", 32): ((1, 2, 4, 8), 16, (1,)),
+    ("write", 16): ((1, 2, 4, 8), 16, (1,)),
+    ("prefetch", 16): (_ROWS, 16, (1, 2)),
+    ("prefetch", 8): (_ROWS, 32, (1, 2)),
 }
 PITCH_ALIGNMENT = 16  # bytes; anything coarser than 4 bytes but not 16 reads wrong data
 X_ALIGNMENT = 4  # bytes
@@ -98,13 +112,18 @@ class Variant:
     kind: str
     bits: int  # element bits in global memory
     rows: int  # block rows in global memory
-    cols: int  # block columns in global memory, in elements
-    words: int  # register words per work-item
+    cols: int  # columns one instruction covers in global memory, in elements
+    words: int  # register words per work-item; 0 for a prefetch
     word_bits: int
 
     @property
+    def direction(self):
+        """``read``, ``write`` or ``prefetch``: the instruction this builtin belongs to."""
+        return {"read_transform": "read"}.get(self.kind, self.kind)
+
+    @property
     def is_read(self):
-        return self.kind != "write"
+        return self.direction == "read"
 
 
 def variant(name):
@@ -112,11 +131,14 @@ def variant(name):
     match = _NAME.match(name)
     if match is None:
         raise ValueError(f"Unknown 2D block instruction {name!r}")
-    kind, bits, rows, cols = match.group(1), *(int(g) for g in match.group(2, 3, 4))
+    kind, bits, rows, cols, blocks = match.group(1), *(int(g) for g in match.group(2, 3, 4, 5))
     allowed = VERIFIED.get((kind, bits))
-    if allowed is None or rows not in allowed[0] or cols != allowed[1]:
+    if allowed is None or rows not in allowed[0] or cols != allowed[1] or blocks not in allowed[2]:
         raise ValueError(f"{name}: this 2D block variant has not been verified")
-    if kind == "read_transform":
+    cols *= blocks
+    if kind == "prefetch":
+        word_bits, words = 0, 0
+    elif kind == "read_transform":
         word_bits, words = 32, rows * bits // 32
     elif kind == "read":
         word_bits, words = 16 if bits <= 16 else 32, rows
@@ -198,13 +220,49 @@ class _Surface:
         return Shuffle([x, y], [IntImm("int32", 0), IntImm("int32", 1)])
 
 
-def _lower(view, sctx, direction):
-    instruction, dst, src = view.args
+def _checked_variant(instruction, direction):
     name = instruction.value if hasattr(instruction, "value") else str(instruction)
     var = variant(name)
-    if var.is_read != (direction == "read"):
-        expected = "block_read" if var.is_read else "block_write"
-        raise ValueError(f"{name} belongs to {expected}")
+    if var.direction != direction:
+        raise ValueError(f"{name} belongs to block_{var.direction}")
+    return var
+
+
+def _lower_prefetch(view, sctx):
+    """Prefetch each block of a global region into cache; nothing reaches registers.
+
+    A prefetch cannot change data, but it uses the same surface descriptor as a
+    read, so it is held to the same proofs: a descriptor that misreads would only
+    prefetch the wrong lines, which a caller would not notice.
+    """
+    instruction, src = view.args
+    var = _checked_variant(instruction, "prefetch")
+    require_intel_target(sctx.target, "block_prefetch")
+    analyzer, _, resolve = context_analyzer(sctx)
+    surface = _Surface(src, var, analyzer, resolve)
+    width, height, pitch = (
+        Cast("int32", x) for x in (surface.width, surface.height, surface.pitch)
+    )
+    body = []
+    for i in range(surface.extent[0] // var.rows):
+        for j in range(surface.extent[1] // var.cols):
+            call = T.call_extern(
+                var.name,
+                surface.tensor.data,
+                width,
+                height,
+                pitch,
+                surface.coordinate(var, i, j),
+                ty="void",
+            )
+            body.append(Evaluate(call))
+    return SeqStmt(body)
+
+
+def _lower(view, sctx, direction):
+    instruction, dst, src = view.args
+    var = _checked_variant(instruction, direction)
+    name = var.name
     require_intel_target(sctx.target, f"block_{direction}")
     registers, memory = (dst, src) if var.is_read else (src, dst)
 
@@ -255,3 +313,13 @@ def _instruction(direction):
 
 publish("block_read", _instruction("read"))
 publish("block_write", _instruction("write"))
+publish(
+    "block_prefetch",
+    Instruction(
+        "tirx.opencl.tile.block_prefetch",
+        "intel_block_prefetch",
+        (Operand("instruction"), Operand("src", "region")),
+        ("subgroup",),
+        lower=_lower_prefetch,
+    ).register(),
+)

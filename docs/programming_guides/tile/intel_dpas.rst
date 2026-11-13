@@ -258,9 +258,74 @@ block's x offset is 4-byte aligned. Reads outside the matrix return zero and
 writes outside it are dropped, so edge tiles need no masking.
 
 On an Arc Pro B60, this kernel with ``4 x 4`` sub-groups per work-group computes
-a ``2048``\ :sup:`3` float16 product at 64--67 TFLOP/s, against 8.6 TFLOP/s
+a ``2048``\ :sup:`3` float16 product at 63--67 TFLOP/s, against 8.6 TFLOP/s
 with scalar fragment loads and 2.0 TFLOP/s for a scalar-FMA kernel. These are
 medians over interleaved runs; a single run on a shared machine can read far
-lower while the clocks ramp up. Larger sub-group tiles exhaust the default
-register file and spill, which a later change can address with the driver's
-256-register mode.
+lower while the clocks ramp up.
+
+Larger Tiles
+------------
+
+A sub-group that computes more of ``C`` loads each fragment once for more
+matrix instructions. Three changes take the kernel above to a ``64 x 32``
+sub-group tile with a K step of 32:
+
+.. code-block:: python
+
+    def lay(shape, strides):
+        return TileLayout(S[shape : (*strides, 1 @ sglid)])
+
+    a_read, a_dpas = lay((2, 2, 32, 16), (32, 64, 1)), lay((8, 2, 8, 16), (8, 64, 1))
+    b_read, b_dpas = lay((1, 2, 16, 16), (32, 16, 1)), lay((2, 2, 8, 16), (8, 16, 1))
+    d = lay((8, 2, 8, 16), (16, 8, 1))
+    prefetch = "intel_sub_group_2d_block_prefetch_16b_32r16x2c"
+
+    for kb in T.serial(K // 32, unroll=False):
+        k = kb * 32
+        T.opencl.tile.block_prefetch(prefetch, A[row0 : row0 + 64, k + 32 : k + 64], scope="subgroup")
+        T.opencl.tile.block_prefetch(prefetch, B[k + 32 : k + 64, col0 : col0 + 32], scope="subgroup")
+        T.opencl.tile.block_read(
+            "intel_sub_group_2d_block_read_16b_32r16x1c",
+            ar.view(2, 2, 32, 16, layout=a_read), A[row0 : row0 + 64, k : k + 32],
+            scope="subgroup",
+        )
+        T.opencl.tile.block_read(
+            "intel_sub_group_2d_block_read_transform_16b_32r16x1c",
+            br.view(T.uint32.dtype).view(1, 2, 16, 16, layout=b_read),
+            B[k : k + 32, col0 : col0 + 32], scope="subgroup",
+        )
+        T.opencl.tile.dpas(
+            "intel_sub_group_f16_f16_matrix_mad_k16",
+            dr.view(8, 2, 8, 16, layout=d),
+            ar.view(8, 2, 8, 16, layout=a_dpas),
+            br.view(T.uint32.dtype).view(2, 2, 8, 16, layout=b_dpas),
+            dr.view(8, 2, 8, 16, layout=d),
+            scope="subgroup",
+        )
+
+**One buffer, two views.** A 32-row block read fills four ``A`` fragments at
+once, so each register buffer is described twice: as block-read atoms and as
+DPAS fragments. Both views are checked, so their layouts must agree. Ordering
+``A`` by K block, then 32-row block, then row (offset ``64·kb + 32·rb + r``)
+gives each a single stride per axis: rows of consecutive fragments then sit
+eight apart in both.
+
+**Keep the K loop rolled.** IGC fully unrolls a loop whose trip count is
+constant, and a body of 32 matrix instructions does not survive that:
+unrolled, this kernel ran at 48 TFLOP/s, against 84 kept rolled.
+``T.serial(n, unroll=False)`` emits ``#pragma unroll 1``.
+
+**Prefetch one step ahead.** ``block_prefetch`` pulls the next K step's blocks
+into cache. Prefetching one step ahead gained 25%; two steps ahead lost about
+as much, so the distance is worth measuring rather than guessing.
+
+The tile needs more than the 128 registers an Xe work-item has by default. The
+``intel/*`` targets build each kernel with ``-cl-intel-enable-auto-large-GRF-mode``,
+which gives a kernel 256 registers only when it would otherwise spill; forcing
+256 everywhere instead halves occupancy and cost the smaller kernel above a
+third of its speed. The option reaches the compiler through the ``opencl``
+target's ``build_options``.
+
+On the B60 the ``64 x 32`` kernel computes ``4096``\ :sup:`3` at 88 TFLOP/s and
+``2048``\ :sup:`3` at 71 TFLOP/s, against 67 and 63 TFLOP/s for the ``32 x 32``
+kernel and 1.5 and 2.0 TFLOP/s for scalar FMA.
