@@ -536,6 +536,31 @@ void CodeGenOpenCL::PrintVecConstructor(const PrimType& t, std::ostream& os) {  
   os << ')';
 }
 
+void CodeGenOpenCL::PrintLoopPragma(const ForObj* op) {
+  // The loop annotations the CUDA backend honors, with the same meaning; T.serial(n, unroll=...)
+  // sets them.  Clang-based OpenCL compilers, IGC among them, accept #pragma unroll, and a C
+  // compiler ignores a pragma it does not know.  Unrolling matters here: IGC fully unrolls a loop
+  // whose trip count is constant, and a GEMM K loop of 32 matrix instructions on an Arc Pro B60
+  // ran at 48 TFLOP/s unrolled against 84 with `#pragma unroll 1`.
+  //
+  // Only the explicit annotations are honored.  A ForKind::kUnrolled loop is left as it was, so
+  // kernels that set neither annotation generate exactly the code they did before.
+  if (op->annotations.count(tvm::tirx::attr::kDisableUnroll.name)) {
+    PrintIndent();
+    stream << "#pragma unroll 1\n";
+  } else if (auto it = op->annotations.find(tvm::tirx::attr::kPragmaUnroll);
+             it != op->annotations.end()) {
+    PrintIndent();
+    stream << "#pragma unroll";
+    if (auto count = (*it).second.as<int64_t>()) {
+      stream << " " << count.value();
+    } else if (const auto* count = (*it).second.as<IntImmObj>()) {
+      stream << " " << count->value;
+    }
+    stream << "\n";
+  }
+}
+
 void CodeGenOpenCL::DispatchAllocTensor(const BindObj* op, const CallObj* buffer_call) {
   tvm::Tuple shape = tvm::Tuple(buffer_call->ty_args[0].as_or_throw<tirx::TensorType>()->shape);
   DLDataType dtype = buffer_call->ty_args[0].as_or_throw<tirx::TensorType>()->dtype->dtype;

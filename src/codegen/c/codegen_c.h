@@ -241,7 +241,15 @@ class CodeGenC : public tvm::ExprFunctor<void(const Expr&, std::ostream&)>,
    * \param os The output stream.
    */
   virtual void PrintAllocAttributes(const tirx::TensorType& type, std::ostream& os) {}  // NOLINT(*)
-  virtual void PrintStorageSync(const CallObj* op);                                     // NOLINT(*)
+  /*!
+   * \brief Print directives that must immediately precede a for loop, such as an unroll pragma.
+   *
+   * Called after the loop bounds are materialized, so no temporaries they need can be printed
+   * between the directive and the loop it controls.
+   * \param op The loop.
+   */
+  virtual void PrintLoopPragma(const ForObj* op) {}
+  virtual void PrintStorageSync(const CallObj* op);  // NOLINT(*)
   // Binary vector op.
   virtual void PrintVecBinaryOp(const std::string& op, const PrimType& op_type, PrimExpr lhs,
                                 PrimExpr rhs,

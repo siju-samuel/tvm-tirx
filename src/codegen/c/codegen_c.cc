@@ -1435,6 +1435,7 @@ void CodeGenC::Dispatch_(const ForObj* op) {
   std::string begin_str = PrintExpr(op->begin);
   std::string end_str = PrintExpr(op->end);
   std::string step_str = op->HasTrivialStep() ? "" : PrintExpr(op->step);
+  PrintLoopPragma(op);
   PrintIndent();
   std::string vid = AllocVarID(op->var.get());
   stream << "for (";

@@ -544,8 +544,8 @@ def serial(
         The optional step value of iteration.
 
     unroll : bool or int, optional
-        If True, adds ``{"tirx.pragma_unroll": True}`` annotation, which asks CUDA codegen
-        to emit ``#pragma unroll`` while preserving the loop as a C++ ``for``.
+        If True, adds ``{"tirx.pragma_unroll": True}`` annotation, which asks CUDA and
+        OpenCL codegen to emit ``#pragma unroll`` while preserving the loop as a ``for``.
         If False, adds ``{"tirx.disable_unroll": True}`` annotation.
         If a positive integer, emits ``#pragma unroll N``. Boolean values are
         handled separately from integers, so ``False`` keeps disabling unrolling.
