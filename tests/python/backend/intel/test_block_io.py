@@ -54,17 +54,18 @@ requires_intel_gpu = pytest.mark.skipif(
 )
 
 
-def _name(kind, bits, rows, cols):
-    return f"intel_sub_group_2d_block_{kind}_{bits}b_{rows}r{cols}x1c"
+def _name(kind, bits, rows, cols, blocks=1):
+    return f"intel_sub_group_2d_block_{kind}_{bits}b_{rows}r{cols}x{blocks}c"
 
 
 VARIANTS = [
-    _name(kind, bits, rows, cols)
-    for (kind, bits), (row_choices, cols) in VERIFIED.items()
+    _name(kind, bits, rows, cols, blocks)
+    for (kind, bits), (row_choices, cols, block_choices) in VERIFIED.items()
     for rows in row_choices
+    for blocks in block_choices
 ]
-READS = [n for n in VARIANTS if variant(n).is_read]
-WRITES = [n for n in VARIANTS if not variant(n).is_read]
+READS = [n for n in VARIANTS if variant(n).direction == "read"]
+WRITES = [n for n in VARIANTS if variant(n).direction == "write"]
 
 
 def _elem(bits):
@@ -374,6 +375,140 @@ def test_gemm_on_block_io():
                         )
 
     fun = tvm_tirx.compile(Module, target=TARGET)
+    rng = np.random.default_rng(0)
+    a = rng.standard_normal((M, K)).astype(np.float16)
+    b = rng.standard_normal((K, N)).astype(np.float16)
+
+    def run_and_check():
+        dev = tvm_tirx.opencl(0)
+        args = [tvm_tirx.runtime.tensor(x, dev) for x in (a, b, np.zeros((M, N), np.float32))]
+        fun["main"](*args)
+        want = a.astype(np.float32) @ b.astype(np.float32)
+        np.testing.assert_allclose(args[2].numpy(), want, rtol=1e-3, atol=1e-3)
+
+    tvm_tirx.testing.run_with_gpu_lock(run_and_check)
+
+
+def _prefetch_function(name, region):
+    (y0, y1), (x0, x1) = region
+
+    @T.function
+    def main(M: T.Tensor((ROWS, 128), "uint16")):
+        T.func_attr({"tirx.noalias": True})
+        with T.launch_thread("blockIdx.x", 1):
+            with T.launch_thread("threadIdx.x", 16):
+                T.opencl.tile.block_prefetch(name, M[y0:y1, x0:x1], scope="subgroup")
+
+    return main
+
+
+def test_prefetch_lowers_to_one_call_per_block(opencl_source):
+    """A 64 x 32 region is two 32 x 32 blocks of the two-block-wide variant."""
+    name = _name("prefetch", 16, 32, 16, 2)
+    source = opencl_source(_prefetch_function(name, ((0, 64), (32, 64))))
+    assert source.count(f"{name}(M_ptr, 256, 64, 256, (int2)(") == 2
+
+
+PREFETCH_REJECTIONS = {
+    "read variant": (_name("read", 16, 8, 16), "belongs to block_read"),
+    "unverified width": (
+        _name("prefetch", 16, 8, 16).replace("x1c", "x4c"),
+        "has not been verified",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", PREFETCH_REJECTIONS, ids=list(PREFETCH_REJECTIONS))
+def test_prefetch_rejects(opencl_source, case):
+    name, reason = PREFETCH_REJECTIONS[case]
+    with pytest.raises(Exception, match=reason):
+        opencl_source(_prefetch_function(name, ((0, 8), (0, 64))))
+
+
+def test_reads_are_not_accepted_two_blocks_wide(opencl_source):
+    """Only prefetch was checked two blocks wide; a read of that width is rejected."""
+    with pytest.raises(Exception, match="has not been verified"):
+        _reject(opencl_source, _name("read", 16, 8, 16, 2), ((0, 8), (0, 32)))
+
+
+def _lay(shape, strides):
+    return TileLayout(S[tuple(shape) : (*strides, 1 @ sglid)])
+
+
+@pytest.mark.gpu
+@requires_intel_gpu
+def test_large_tile_gemm():
+    """The large-tile GEMM: 64 x 32 sub-group tiles, a K step of 32, a one-step
+    prefetch, and a K loop kept rolled.  Each register buffer is viewed twice, once
+    as block-read atoms and once as DPAS fragments, so the layouts must agree.
+    Without the automatic large register file this kernel spills; it stays correct
+    but runs over 20x slower, so this checks the result, not the speed."""
+    M = N = K = 512
+    TM, TN, TK, SG_M, SG_N = 64, 32, 32, 4, 4
+    WM, WN = SG_M * TM, SG_N * TN
+    a_read, a_dpas = _lay((2, 2, 32, 16), (32, 64, 1)), _lay((8, 2, 8, 16), (8, 64, 1))
+    b_read, b_dpas = _lay((1, 2, 16, 16), (32, 16, 1)), _lay((2, 2, 8, 16), (8, 16, 1))
+    d = _lay((8, 2, 8, 16), (16, 8, 1))
+    prefetch = "intel_sub_group_2d_block_prefetch_16b_32r16x2c"
+
+    @I.ir_module
+    class Module:
+        @T.function
+        def main(
+            A: T.Tensor((M, K), "float16"),
+            B: T.Tensor((K, N), "float16"),
+            C: T.Tensor((M, N), "float32"),
+        ):
+            T.func_attr({"tirx.noalias": True})
+            with T.launch_thread("blockIdx.y", M // WM) as by:
+                with T.launch_thread("blockIdx.x", N // WN) as bx:
+                    with T.launch_thread("threadIdx.x", SG_M * SG_N * 16) as tx:
+                        ar = T.alloc_local((128,), "float16")
+                        br = T.alloc_local((64,), "float16")
+                        dr = T.alloc_local((128,), "float32")
+                        row0 = by * WM + (tx // 16 // SG_N) * TM
+                        col0 = bx * WN + (tx // 16 % SG_N) * TN
+                        for e in range(128):
+                            dr[e] = T.float32(0)
+                        for kb in T.serial(K // TK, unroll=False):
+                            k = kb * TK
+                            T.opencl.tile.block_prefetch(
+                                prefetch, A[row0 : row0 + TM, k + TK : k + 2 * TK], scope="subgroup"
+                            )
+                            T.opencl.tile.block_prefetch(
+                                prefetch, B[k + TK : k + 2 * TK, col0 : col0 + TN], scope="subgroup"
+                            )
+                            T.opencl.tile.block_read(
+                                "intel_sub_group_2d_block_read_16b_32r16x1c",
+                                ar.view(2, 2, 32, 16, layout=a_read),
+                                A[row0 : row0 + TM, k : k + TK],
+                                scope="subgroup",
+                            )
+                            T.opencl.tile.block_read(
+                                "intel_sub_group_2d_block_read_transform_16b_32r16x1c",
+                                br.view(T.uint32.dtype).view(1, 2, 16, 16, layout=b_read),
+                                B[k : k + TK, col0 : col0 + TN],
+                                scope="subgroup",
+                            )
+                            T.opencl.tile.dpas(
+                                "intel_sub_group_f16_f16_matrix_mad_k16",
+                                dr.view(8, 2, 8, 16, layout=d),
+                                ar.view(8, 2, 8, 16, layout=a_dpas),
+                                br.view(T.uint32.dtype).view(2, 2, 8, 16, layout=b_dpas),
+                                dr.view(8, 2, 8, 16, layout=d),
+                                scope="subgroup",
+                            )
+                        T.opencl.tile.block_write(
+                            "intel_sub_group_2d_block_write_32b_8r16x1c",
+                            C[row0 : row0 + TM, col0 : col0 + TN],
+                            dr.view(8, 2, 8, 16, layout=d),
+                            scope="subgroup",
+                        )
+
+    fun = tvm_tirx.compile(Module, target=TARGET)
+    source = fun.mod.imports[0].inspect_source("cl")
+    assert "// Build options: -cl-intel-enable-auto-large-GRF-mode" in source
+    assert "#pragma unroll 1" in source
     rng = np.random.default_rng(0)
     a = rng.standard_normal((M, K)).astype(np.float16)
     b = rng.standard_normal((K, N)).astype(np.float16)
