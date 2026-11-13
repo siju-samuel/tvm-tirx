@@ -50,6 +50,14 @@ def test_intel_tag_declares_sub_group_width():
     assert Target("opencl").attrs["thread_warp_size"] == 1
 
 
+def test_intel_tag_lets_the_compiler_choose_the_register_file():
+    """Forcing 256 registers halves occupancy and cost a kernel that fits in 128 a
+    third of its speed; automatic mode takes 256 only for a kernel that would spill."""
+    for tag in ("intel/arc-b60-opencl", "intel/xe-opencl"):
+        assert Target(tag).attrs["build_options"] == "-cl-intel-enable-auto-large-GRF-mode"
+    assert "build_options" not in Target("opencl").attrs
+
+
 def test_intel_backend_is_autoloaded():
     import tvm_tirx.backend as backend
 
