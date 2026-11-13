@@ -56,6 +56,25 @@ inline std::unordered_map<std::string, std::string> SplitKernels(
   }
   return split_kernels;
 }
+
+/*!
+ * \brief The OpenCL compiler options a kernel's source asks to be built with.
+ *
+ * Code generation records them as the first line of the kernel's source, after the
+ * delimiter SplitKernels removes, because the source is the only per-kernel artifact an
+ * OpenCL module carries through export and load.
+ *
+ * \param kernel_source One kernel's source, as SplitKernels returns it.
+ * \param prefix The marker that introduces the options line.
+ * \return The options, or an empty string if the kernel names none.
+ */
+inline std::string KernelBuildOptions(const std::string& kernel_source,
+                                      const std::string& prefix = "// Build options: ") {
+  if (kernel_source.compare(0, prefix.size(), prefix) != 0) return "";
+  size_t end = kernel_source.find('\n');
+  return kernel_source.substr(prefix.size(),
+                              end == std::string::npos ? std::string::npos : end - prefix.size());
+}
 }  // namespace runtime
 }  // namespace tvm
 

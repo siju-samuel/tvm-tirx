@@ -267,10 +267,12 @@ cl_kernel OpenCLModuleObj::InstallKernel(cl::OpenCLWorkspace* w, cl::OpenCLThrea
     } else {
       TVM_FFI_THROW(InternalError) << "Unknown OpenCL format " << fmt_;
     }
-    // build program
+    // build program, with any compiler options the kernel's source records
     cl_int err;
     cl_device_id dev = w->devices[device_id];
-    err = clBuildProgram(programs_[func_name][device_id], 1, &dev, nullptr, nullptr, nullptr);
+    std::string options = fmt_ == "cl" ? KernelBuildOptions(parsed_kernels_[func_name]) : "";
+    err = clBuildProgram(programs_[func_name][device_id], 1, &dev,
+                         options.empty() ? nullptr : options.c_str(), nullptr, nullptr);
     if (err != CL_SUCCESS) {
       size_t len;
       std::string log;

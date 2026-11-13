@@ -883,6 +883,11 @@ ffi::Module BuildOpenCL(IRModule mod, Target target) {
   // Only a target that states its sub-group width can have been lowered to sub-group builtins; the
   // opencl default of 1 means the width is unknown.  See LowerThreadAllreduce.
   int64_t warp_size = target->GetAttr<int64_t>("thread_warp_size", 1).value();
+  // Compiler options are recorded in each kernel's source, which the runtime reads when it builds
+  // that kernel; see KernelBuildOptions.  A newline would end the directive early, so reject it.
+  std::string build_options = target->GetAttr<ffi::String>("build_options").value_or("");
+  TVM_FFI_CHECK(build_options.find('\n') == std::string::npos, ValueError)
+      << "OpenCL build_options must be a single line";
 
   ffi::Map<GlobalVar, Function> functions;
   for (auto [gvar, base_func] : mod->functions) {
@@ -901,6 +906,7 @@ ffi::Module BuildOpenCL(IRModule mod, Target target) {
   const auto fpostproc = tvm::ffi::Function::GetGlobal("tvm_callback_opencl_postproc");
   for (auto [gvar, function] : functions) {
     code << "// Function: " << gvar->name_hint << std::endl;
+    if (!build_options.empty()) code << "// Build options: " << build_options << std::endl;
     CodeGenOpenCL cg;
     cg.Init(output_ssa);
     for (auto [other_gvar, other_function] : functions) {
