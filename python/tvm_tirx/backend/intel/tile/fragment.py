@@ -72,13 +72,41 @@ def vector_type(dtype, lanes):
     return dtype if lanes == 1 else f"{dtype}x{lanes}"
 
 
-class Fragment:
-    """One register operand, checked against the atom's work-item mapping."""
+class Atom:
+    """Where an instruction expects each value of one atom: work-item and register component.
 
-    def __init__(self, name, region, atom_rows, analyzer, layout_analyzer):
+    ``lane`` and ``component`` map the atom's coordinates to the sub-group
+    work-item that holds the value and its offset among that work-item's
+    ``components`` registers.  ``rows`` builds the mapping almost every Intel
+    instruction uses; an instruction with another declares its own.
+    """
+
+    def __init__(self, shape, lane, component, components, lane_rule, component_rule):
+        self.shape, self.components = tuple(shape), components
+        self.lane, self.component = lane, component
+        self.lane_rule, self.component_rule = lane_rule, component_rule
+
+    @classmethod
+    def rows(cls, rows):
+        """``(rows, 16)``: coordinate ``(row, col)`` on work-item ``col``, component ``row``."""
+        return cls(
+            (rows, SUB_GROUP_SIZE),
+            lambda c: c[1],
+            lambda c: c[0],
+            rows,
+            "atom column must be the work-item index within the sub-group (sglid)",
+            "each work-item's atom must occupy consecutive registers in row order",
+        )
+
+
+class Fragment:
+    """One register operand, checked against its atom's work-item mapping."""
+
+    def __init__(self, name, region, atom, analyzer, layout_analyzer):
         if not isinstance(region, TensorRegion):
             raise TypeError(f"{name}: expected a register tensor region")
-        self.name, self.region = name, region
+        atom = atom if isinstance(atom, Atom) else Atom.rows(atom)
+        self.name, self.region, self.atom = name, region, atom
         self.tensor, self.ty = region.source, region.source.ty
         self.dtype = str(self.ty.dtype.dtype)
         self.analyzer, self.layout_analyzer = analyzer, layout_analyzer
@@ -88,20 +116,21 @@ class Fragment:
         if self.layout is None:
             raise ValueError(f"{name}: operand requires a physical layout")
         self.shape = tuple(int(analyzer.simplify(r.extent)) for r in region.region)
-        if len(self.shape) < 4 or self.shape[-2:] != (atom_rows, SUB_GROUP_SIZE):
+        n = len(atom.shape)
+        if len(self.shape) < n + 2 or self.shape[-n:] != atom.shape:
             raise ValueError(
-                f"{name}: expected (*batch, R0, R1, {atom_rows}, {SUB_GROUP_SIZE}), "
+                f"{name}: expected (*batch, R0, R1, {', '.join(map(str, atom.shape))}), "
                 f"got {self.shape}"
             )
         for r, size in zip(region.region, self.ty.shape):
             self._require(r.begin >= 0, "region start is out of bounds")
             self._require(r.begin + r.extent <= size, "region exceeds the tensor shape")
-        self.rows = atom_rows
+        self.rows = atom.components
         self.raws = {}
 
     @property
     def repeats(self):
-        return self.shape[:-2]
+        return self.shape[: -len(self.atom.shape)]
 
     def require_bits(self, bits, what):
         dtype = self.ty.dtype.dtype
@@ -123,28 +152,25 @@ class Fragment:
     def base(self, repeat):
         """Check one repeat's atom against the hardware mapping; return its storage base.
 
-        Work-item ``lane`` and component ``row`` are symbolic over the whole atom,
-        so the proof covers every position at once rather than sampling them.
+        The atom coordinates are symbolic over their whole range, so the proof
+        covers every position at once rather than sampling them.
         """
-        lane, row = Var("dpas_lane", "int32"), Var("dpas_row", "int32")
+        coords = [Var(f"atom_{i}", "int32") for i in range(len(self.atom.shape))]
         constraints = ConstraintContext()
-        constraints.append(RangeConstraint(lane, Range(0, SUB_GROUP_SIZE)))
-        constraints.append(RangeConstraint(row, Range(0, self.rows)))
+        for var, extent in zip(coords, self.atom.shape):
+            constraints.append(RangeConstraint(var, Range(0, extent)))
         self.analyzer.sync_constraint_context(constraints)
         try:
-            physical = self._physical((*repeat, row, lane))
+            physical = self._physical((*repeat, *coords))
             for axis in set(physical) - {"m", "sglid"}:
                 self._require(
                     physical[axis] == 0, f"atom places values on unexpected axis {axis!r}"
                 )
+            self._require(physical.get("sglid", 0) == self.atom.lane(coords), self.atom.lane_rule)
+            origin = self._physical((*repeat, *([0] * len(coords)))).get("m", 0)
             self._require(
-                physical.get("sglid", 0) == lane,
-                "atom column must be the work-item index within the sub-group (sglid)",
-            )
-            origin = self._physical((*repeat, 0, 0)).get("m", 0)
-            self._require(
-                physical.get("m", 0) == origin + row,
-                "each work-item's atom must occupy consecutive registers in row order",
+                physical.get("m", 0) == origin + self.atom.component(coords),
+                self.atom.component_rule,
             )
         finally:
             self.analyzer.sync_constraint_context(ConstraintContext())
@@ -177,8 +203,9 @@ class Fragment:
         target = vector_type(as_dtype, self.rows)
         return value if self.dtype == as_dtype else T.reinterpret(value, ty=target)
 
-    def store(self, bindings, base, value):
-        raw = self.storage(bindings)
+    def store(self, bindings, base, value, dtype=None):
+        """Store a component vector; ``dtype`` names the type ``value`` was computed in."""
+        raw = self.storage(bindings, dtype)
         index = base if self.rows == 1 else Ramp(base, 1, self.rows)
         return TensorStore(raw, [index], value)
 

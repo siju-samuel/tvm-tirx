@@ -349,5 +349,173 @@ def test_gemm_across_work_groups():
     tvm_tirx.testing.run_with_gpu_lock(run_and_check)
 
 
+def _bf16_bits(x):
+    return (x.astype(np.float32).view(np.uint32) >> 16).astype(np.uint16)
+
+
+def tf32_module(mr, nr, kr, m):
+    comps = m // 2
+    M, N, K = mr * m, nr * 16, kr * 8
+    # (Mr, Kr, c, h, k): row 2c + h, column k on work-item 8h + k, component c.
+    a_layout = TileLayout(S[(mr, kr, comps, 2, 8) : (kr * comps, comps, 1, 8 @ sglid, 1 @ sglid)])
+
+    @I.ir_module
+    class Module:
+        @T.function
+        def main(
+            A: T.Tensor((M, K), "float32"),
+            B: T.Tensor((K, N), "float32"),
+            C: T.Tensor((M, N), "float32"),
+            D: T.Tensor((M, N), "float32"),
+        ):
+            T.func_attr({"tirx.noalias": True})
+            with T.launch_thread("blockIdx.x", 1):
+                with T.launch_thread("threadIdx.x", 16) as lane:
+                    ar = T.alloc_local((mr * kr * comps,), "float32")
+                    br = T.alloc_local((kr * nr * 8,), "float32")
+                    dr = T.alloc_local((mr * nr * m,), "float32")
+                    for i, k, c in T.grid(mr, kr, comps):
+                        ar[(i * kr + k) * comps + c] = A[
+                            i * m + 2 * c + lane // 8, k * 8 + lane % 8
+                        ]
+                    for k, j, e in T.grid(kr, nr, 8):
+                        br[(k * nr + j) * 8 + e] = B[k * 8 + e, j * 16 + lane]
+                    for i, j, r in T.grid(mr, nr, m):
+                        dr[(i * nr + j) * m + r] = C[i * m + r, j * 16 + lane]
+                    T.opencl.tile.dpas(
+                        "intel_sub_group_tf32_tf32_matrix_mad_k8",
+                        dr.view(mr, nr, m, 16, layout=frag(mr, nr, m)),
+                        ar.view(mr, kr, comps, 2, 8, layout=a_layout),
+                        br.view(kr, nr, 8, 16, layout=frag(kr, nr, 8)),
+                        dr.view(mr, nr, m, 16, layout=frag(mr, nr, m)),
+                        scope="subgroup",
+                    )
+                    for i, j, r in T.grid(mr, nr, m):
+                        D[i * m + r, j * 16 + lane] = dr[(i * nr + j) * m + r]
+
+    return Module, (M, N, K)
+
+
+def bf16acc_module(mr, nr, kr, m):
+    M, N, K = mr * m, nr * 16, kr * 16
+
+    @I.ir_module
+    class Module:
+        @T.function
+        def main(
+            A: T.Tensor((M, K), "bfloat16"),
+            B: T.Tensor((K, N), "bfloat16"),
+            C: T.Tensor((M, N), "bfloat16"),
+            D: T.Tensor((M, N), "bfloat16"),
+        ):
+            T.func_attr({"tirx.noalias": True})
+            with T.launch_thread("blockIdx.x", 1):
+                with T.launch_thread("threadIdx.x", 16) as lane:
+                    ar = T.alloc_local((mr * kr * m,), "bfloat16")
+                    br = T.alloc_local((kr * nr * 16,), "bfloat16")
+                    dr = T.alloc_local((mr * nr * m,), "bfloat16")
+                    for i, k, r in T.grid(mr, kr, m):
+                        ar[(i * kr + k) * m + r] = A[i * m + r, k * 16 + lane]
+                    for k, j, e in T.grid(kr, nr, 16):
+                        br[(k * nr + j) * 16 + e] = B[k * 16 + e, j * 16 + lane]
+                    for i, j, r in T.grid(mr, nr, m):
+                        dr[(i * nr + j) * m + r] = C[i * m + r, j * 16 + lane]
+                    T.opencl.tile.dpas(
+                        "intel_sub_group_bf16_bf16_matrix_mad_k16",
+                        dr.view(mr, nr, m, 16, layout=frag(mr, nr, m)),
+                        ar.view(mr, kr, m, 16, layout=frag(mr, kr, m)),
+                        br.view(T.uint32.dtype).view(kr, nr, 8, 16, layout=frag(kr, nr, 8)),
+                        dr.view(mr, nr, m, 16, layout=frag(mr, nr, m)),
+                        scope="subgroup",
+                    )
+                    for i, j, r in T.grid(mr, nr, m):
+                        D[i * m + r, j * 16 + lane] = dr[(i * nr + j) * m + r]
+
+    return Module, (M, N, K)
+
+
+def test_tf32_lowers_with_its_own_a_operand(opencl_source):
+    """tf32 A is M x 8 with two rows per component: a float4 for M = 8."""
+    module, _ = tf32_module(1, 1, 1, 8)
+    source = opencl_source(module)
+    assert "intel_sub_group_tf32_tf32_matrix_mad_k8(vload4(" in source
+
+
+def test_tf32_rejects_m_of_one(opencl_source):
+    """The driver declares M = 1, but it leaves half the work-items' A unused."""
+    with pytest.raises(Exception, match=r"takes an atom row count in \(2, 4, 8\)"):
+        opencl_source(tf32_module(1, 1, 1, 1)[0])
+
+
+def test_tf32_rejects_the_ordinary_a_layout(opencl_source):
+    """A tf32 A in the (rows, 16) layout other families use puts rows on the wrong lanes."""
+
+    @T.function
+    def main(D: T.Tensor((8, 16), "float32")):
+        T.func_attr({"tirx.noalias": True})
+        with T.launch_thread("blockIdx.x", 1):
+            with T.launch_thread("threadIdx.x", 16) as lane:
+                ar = T.alloc_local((8,), "float32")
+                br = T.alloc_local((8,), "float32")
+                dr = T.alloc_local((8,), "float32")
+                wrong = TileLayout(S[(1, 1, 4, 2, 8) : (4, 4, 1, 1 @ sglid, 2 @ sglid)])
+                T.opencl.tile.dpas(
+                    "intel_sub_group_tf32_tf32_matrix_mad_k8",
+                    dr.view(1, 1, 8, 16, layout=frag(1, 1, 8)),
+                    ar.view(1, 1, 4, 2, 8, layout=wrong),
+                    br.view(1, 1, 8, 16, layout=frag(1, 1, 8)),
+                    T.float32(0),
+                    scope="subgroup",
+                )
+                for r in range(8):
+                    D[r, lane] = dr[r]
+
+    with pytest.raises(Exception, match="must be on work-item 8h"):
+        opencl_source(main)
+
+
+@pytest.mark.gpu
+@requires_intel_gpu
+@pytest.mark.parametrize("shape", [(1, 1, 1, 8), (2, 2, 3, 8), (2, 1, 2, 4), (3, 2, 2, 2)])
+def test_tf32_matches_reference_product(shape):
+    module, (M, N, K) = tf32_module(*shape)
+    fun = tvm_tirx.compile(module, target=TARGET)
+    rng = np.random.default_rng(0)
+    a, b, c = (rng.integers(-3, 4, s).astype(np.float32) for s in ((M, K), (K, N), (M, N)))
+
+    def run_and_check():
+        dev = tvm_tirx.opencl(0)
+        args = [tvm_tirx.runtime.tensor(x, dev) for x in (a, b, c, np.zeros((M, N), np.float32))]
+        fun["main"](*args)
+        np.testing.assert_array_equal(args[3].numpy(), a @ b + c)
+
+    tvm_tirx.testing.run_with_gpu_lock(run_and_check)
+
+
+@pytest.mark.gpu
+@requires_intel_gpu
+@pytest.mark.parametrize("shape", [(1, 1, 1, 8), (2, 2, 2, 8), (2, 3, 4, 4), (2, 1, 2, 1)])
+def test_bf16_accumulator_matches_reference_product(shape):
+    """Values in [-1, 1] keep every partial sum an integer bf16 holds exactly."""
+    module, (M, N, K) = bf16acc_module(*shape)
+    fun = tvm_tirx.compile(module, target=TARGET)
+    rng = np.random.default_rng(0)
+    a, b, c = (rng.integers(-1, 2, s).astype(np.float32) for s in ((M, K), (K, N), (M, N)))
+
+    def run_and_check():
+        dev = tvm_tirx.opencl(0)
+        args = []
+        for x in (a, b, c):
+            t = tvm_tirx.runtime.empty(x.shape, "bfloat16", dev)
+            t.copyfrom(_bf16_bits(x))
+            args.append(t)
+        out = tvm_tirx.runtime.empty((M, N), "bfloat16", dev)
+        fun["main"](*args, out)
+        bits = np.asarray(out.numpy()).view(np.uint16).astype(np.uint32)
+        np.testing.assert_array_equal((bits << 16).view(np.float32), a @ b + c)
+
+    tvm_tirx.testing.run_with_gpu_lock(run_and_check)
+
+
 if __name__ == "__main__":
     tvm_tirx.testing.main()

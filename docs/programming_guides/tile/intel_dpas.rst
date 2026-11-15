@@ -174,13 +174,21 @@ Instructions
      - float32 or float16
    * - ``intel_sub_group_bf16_bf16_matrix_mad_k16``
      - 16
+     - float32 or bfloat16
+   * - ``intel_sub_group_tf32_tf32_matrix_mad_k8``
+     - 8
      - float32
    * - ``intel_sub_group_i8_i8_matrix_mad_k32``, ``u8_u8``, ``u8_i8``, ``i8_u8``
      - 32
      - int32
 
 The unsigned families take unsigned vectors, and the lowering reinterprets each
-operand to the exact types the builtin declares.
+operand to the exact types the builtin declares. A bfloat16 accumulator travels
+through the builtin as raw 16-bit words. tf32 keeps two A rows in each register
+component, so its A atom is ``(M / 2, 2, 8)`` rather than ``(M, 16)``:
+coordinate ``(c, h, k)`` is row ``2c + h``, held by work-item ``8h + k``. Its
+layout is therefore ``S[(..., M // 2, 2, 8) : (..., 1, 8 @ sglid, 1 @ sglid)]``,
+and an A laid out the way other families expect is rejected.
 
 What Is Checked
 ---------------
@@ -270,6 +278,32 @@ a ``2048``\ :sup:`3` float16 product at 63--67 TFLOP/s, against 8.6 TFLOP/s
 with scalar fragment loads and 2.0 TFLOP/s for a scalar-FMA kernel. These are
 medians over interleaved runs; a single run on a shared machine can read far
 lower while the clocks ramp up.
+
+B Stored Transposed
+-------------------
+
+Model weights are usually stored ``(N, K)``, so a layer computes ``A @ B^T``.
+A 32-bit word of a ``B`` row packs two K-adjacent halves, which is exactly a
+VNNI word, so declaring ``B`` as ``uint32`` words and reading it with the
+transposed block read hands work-item ``n`` row ``n`` as its ``B`` fragment,
+with no repacking:
+
+.. code-block:: python
+
+    # Bw: (batch, N, K // 2) uint32, the (N, K) float16 weights two halves per word
+    T.opencl.tile.block_read(
+        "intel_sub_group_2d_block_read_transpose_32b_16r8x1c",
+        br.view(2, 1, 8, 16, layout=fragment(2, 1, 8)),
+        Bw[bz, col0 : col0 + 32, kb * 8 : kb * 8 + 8],
+        scope="subgroup",
+    )
+
+The region covers 32 rows of ``B`` (the output columns) and 8 words (16 values
+of K), two 16 x 8 blocks. The leading ``bz`` selects one matrix of a batch;
+leading axes of extent 1 are accepted for every block instruction, as long as
+the selected matrix starts 4-byte aligned. The register view's repeats are
+``(N blocks, K blocks)``, which is the transpose of DPAS's ``(Kr, Nr)``, so the
+same registers are passed to ``dpas`` as ``br.view(1, 2, 8, 16, ...)``.
 
 Larger Tiles
 ------------

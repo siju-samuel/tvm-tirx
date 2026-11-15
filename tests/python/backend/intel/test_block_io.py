@@ -73,25 +73,27 @@ def _elem(bits):
 
 
 def read_module(name, y, x):
+    """Read one instruction's worth of blocks and store every register word in order."""
     v = variant(name)
     cols = PITCH_BYTES * 8 // v.bits
     word = tvm_ffi.dtype(_elem(v.word_bits))
+    total = v.blocks * v.words
 
     @I.ir_module
     class Module:
         @T.function
-        def main(M: T.Tensor((ROWS, cols), _elem(v.bits)), W: T.Tensor((v.words, 16), word)):
+        def main(M: T.Tensor((ROWS, cols), _elem(v.bits)), W: T.Tensor((total, 16), word)):
             T.func_attr({"tirx.noalias": True})
             with T.launch_thread("blockIdx.x", 1):
                 with T.launch_thread("threadIdx.x", 16) as lane:
-                    r = T.alloc_local((v.words,), word)
+                    r = T.alloc_local((total,), word)
                     T.opencl.tile.block_read(
                         name,
-                        r.view(1, 1, v.words, 16, layout=frag(1, 1, v.words)),
+                        r.view(1, v.blocks, v.words, 16, layout=frag(1, v.blocks, v.words)),
                         M[y : y + v.rows, x : x + v.cols],
                         scope="subgroup",
                     )
-                    for q in range(v.words):
+                    for q in range(total):
                         W[q, lane] = r[q]
 
     return Module, cols
@@ -100,6 +102,14 @@ def read_module(name, y, x):
 def expected_words(name, block):
     """The register words the hardware produces for ``block``, per the table."""
     v = variant(name)
+    if v.blocks > 1:
+        width = v.block_cols
+        single = name.replace(f"x{v.blocks}c", "x1c")
+        return np.concatenate(
+            [expected_words(single, block[:, b * width : (b + 1) * width]) for b in range(v.blocks)]
+        )
+    if v.kind == "read_transpose":
+        return block.T  # work-item i holds block row i; component c its column c
     if v.kind == "read" and v.bits == 8:
         block = block.astype(np.uint16)
         return block[:, 0::2] | (block[:, 1::2] << 8)
@@ -216,7 +226,7 @@ def test_read_matches_reference_block(name):
         dev = tvm_tirx.opencl(0)
         args = [
             tvm_tirx.runtime.tensor(m, dev),
-            tvm_tirx.runtime.tensor(np.zeros((v.words, 16), _elem(v.word_bits)), dev),
+            tvm_tirx.runtime.tensor(np.zeros(want.shape, _elem(v.word_bits)), dev),
         ]
         fun["main"](*args)
         np.testing.assert_array_equal(args[1].numpy(), want)
@@ -425,10 +435,32 @@ def test_prefetch_rejects(opencl_source, case):
         opencl_source(_prefetch_function(name, ((0, 8), (0, 64))))
 
 
-def test_reads_are_not_accepted_two_blocks_wide(opencl_source):
-    """Only prefetch was checked two blocks wide; a read of that width is rejected."""
+def test_reads_wider_than_verified_are_rejected(opencl_source):
+    """Reads were checked one and two blocks wide; four is not accepted."""
     with pytest.raises(Exception, match="has not been verified"):
-        _reject(opencl_source, _name("read", 16, 8, 16, 2), ((0, 8), (0, 32)))
+        _reject(opencl_source, _name("read", 16, 8, 16, 4), ((0, 8), (0, 64)))
+
+
+def test_two_block_read_needs_consecutive_registers(opencl_source):
+    """The hardware writes block 1's words right after block 0's, so a view that
+    places the two blocks apart in registers must not compile."""
+    name = _name("read", 16, 8, 16, 2)
+    apart = TileLayout(S[(1, 2, 8, 16) : (32, 16, 1, 1 @ sglid)])  # block 1 at 16, not 8
+
+    @T.function
+    def main(M: T.Tensor((ROWS, 128), "uint16"), W: T.Tensor((8, 16), "uint16")):
+        T.func_attr({"tirx.noalias": True})
+        with T.launch_thread("blockIdx.x", 1):
+            with T.launch_thread("threadIdx.x", 16) as lane:
+                r = T.alloc_local((32,), "uint16")
+                T.opencl.tile.block_read(
+                    name, r.view(1, 2, 8, 16, layout=apart), M[0:8, 0:32], scope="subgroup"
+                )
+                for q in range(8):
+                    W[q, lane] = r[q]
+
+    with pytest.raises(Exception, match="consecutive registers"):
+        opencl_source(main)
 
 
 def _lay(shape, strides):
@@ -521,6 +553,113 @@ def test_large_tile_gemm():
         np.testing.assert_allclose(args[2].numpy(), want, rtol=1e-3, atol=1e-3)
 
     tvm_tirx.testing.run_with_gpu_lock(run_and_check)
+
+
+@pytest.mark.gpu
+@requires_intel_gpu
+def test_batched_nt_gemm():
+    """C[b] = A[b] @ B[b].T with B stored (N, K), as model weights usually are.
+
+    A 32-bit word of a B row packs two K-adjacent halves, so a transposed 32-bit
+    block read hands each work-item one B row as the VNNI words DPAS reads, with
+    no repacking.  The batch index selects each operand's matrix, and blocks
+    address the matrix through an offset base."""
+    BATCH, M, N, K = 3, 128, 128, 128
+    MR, NR, SG_M, SG_N = 4, 2, 2, 2
+    TM, TN = MR * 8, NR * 16
+    WM, WN = SG_M * TM, SG_N * TN
+    d = _lay((MR, NR, 8, 16), (NR * 8, 8, 1))
+
+    @I.ir_module
+    class Module:
+        @T.function
+        def main(
+            A: T.Tensor((BATCH, M, K), "float16"),
+            Bw: T.Tensor((BATCH, N, K // 2), "uint32"),  # B as (N, K) halves, two per word
+            C: T.Tensor((BATCH, M, N), "float32"),
+        ):
+            T.func_attr({"tirx.noalias": True})
+            with T.launch_thread("blockIdx.z", BATCH) as bz:
+                with T.launch_thread("blockIdx.y", M // WM) as by:
+                    with T.launch_thread("blockIdx.x", N // WN) as bx:
+                        with T.launch_thread("threadIdx.x", SG_M * SG_N * 16) as tx:
+                            ar = T.alloc_local((MR * 8,), "float16")
+                            br = T.alloc_local((NR * 8,), "uint32")
+                            dr = T.alloc_local((MR * NR * 8,), "float32")
+                            row0 = by * WM + (tx // 16 // SG_N) * TM
+                            col0 = bx * WN + (tx // 16 % SG_N) * TN
+                            for e in range(MR * NR * 8):
+                                dr[e] = T.float32(0)
+                            for kb in T.serial(K // 16, unroll=False):
+                                T.opencl.tile.block_read(
+                                    "intel_sub_group_2d_block_read_16b_8r16x1c",
+                                    ar.view(MR, 1, 8, 16, layout=frag(MR, 1, 8)),
+                                    A[bz, row0 : row0 + TM, kb * 16 : kb * 16 + 16],
+                                    scope="subgroup",
+                                )
+                                # 16 rows of B (n) by 8 words (16 halves of k): work-item n
+                                # receives row n, which is the B fragment's column n.
+                                T.opencl.tile.block_read(
+                                    "intel_sub_group_2d_block_read_transpose_32b_16r8x1c",
+                                    br.view(NR, 1, 8, 16, layout=_lay((NR, 1, 8, 16), (8, 8, 1))),
+                                    Bw[bz, col0 : col0 + TN, kb * 8 : kb * 8 + 8],
+                                    scope="subgroup",
+                                )
+                                T.opencl.tile.dpas(
+                                    "intel_sub_group_f16_f16_matrix_mad_k16",
+                                    dr.view(MR, NR, 8, 16, layout=d),
+                                    ar.view(MR, 1, 8, 16, layout=frag(MR, 1, 8)),
+                                    br.view(1, NR, 8, 16, layout=_lay((1, NR, 8, 16), (8, 8, 1))),
+                                    dr.view(MR, NR, 8, 16, layout=d),
+                                    scope="subgroup",
+                                )
+                            T.opencl.tile.block_write(
+                                "intel_sub_group_2d_block_write_32b_8r16x1c",
+                                C[bz, row0 : row0 + TM, col0 : col0 + TN],
+                                dr.view(MR, NR, 8, 16, layout=d),
+                                scope="subgroup",
+                            )
+
+    fun = tvm_tirx.compile(Module, target=TARGET)
+    rng = np.random.default_rng(0)
+    a = rng.standard_normal((BATCH, M, K)).astype(np.float16)
+    b = rng.standard_normal((BATCH, N, K)).astype(np.float16)
+
+    def run_and_check():
+        dev = tvm_tirx.opencl(0)
+        args = [
+            tvm_tirx.runtime.tensor(a, dev),
+            tvm_tirx.runtime.tensor(b.view(np.uint32), dev),
+            tvm_tirx.runtime.tensor(np.zeros((BATCH, M, N), np.float32), dev),
+        ]
+        fun["main"](*args)
+        want = a.astype(np.float32) @ b.astype(np.float32).transpose(0, 2, 1)
+        np.testing.assert_allclose(args[2].numpy(), want, rtol=1e-3, atol=1e-3)
+
+    tvm_tirx.testing.run_with_gpu_lock(run_and_check)
+
+
+def test_batched_surface_needs_an_aligned_matrix_start(opencl_source):
+    """The batch offset moves the surface base, which must stay 4-byte aligned."""
+
+    @T.function
+    def main(M: T.Tensor((3, 8, 17), "uint16"), W: T.Tensor((8, 16), "uint16")):
+        T.func_attr({"tirx.noalias": True})
+        with T.launch_thread("blockIdx.x", 1):
+            with T.launch_thread("threadIdx.x", 16) as lane:
+                r = T.alloc_local((8,), "uint16")
+                T.opencl.tile.block_read(
+                    _name("read", 16, 8, 16),
+                    r.view(1, 1, 8, 16, layout=frag(1, 1, 8)),
+                    M[1, 0:8, 0:16],
+                    scope="subgroup",
+                )
+                for q in range(8):
+                    W[q, lane] = r[q]
+
+    # 17 halves per row is also a 34-byte pitch, so either proof may fail first.
+    with pytest.raises(Exception, match=r"pitch must be a multiple|matrix start must be"):
+        opencl_source(main)
 
 
 if __name__ == "__main__":

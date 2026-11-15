@@ -22,7 +22,9 @@ region of a row-major global matrix into sub-group registers with the named
 back.  One instruction moves a whole block, which is what keeps the XMX engines
 fed: a block read replaces the per-element loads a fragment otherwise needs.
 
-The global operand is a 2D region of a row-major tensor.  It is tiled into the
+The global operand is a 2D region of a row-major tensor, or of one matrix of a
+batch: leading axes with extent 1 select the matrix, and its first element must
+stay 4-byte aligned.  It is tiled into the
 instruction's ``rows x cols`` blocks, and the register operand has one
 ``(words, 16)`` atom per block, with repeat axes ``(Rr, Cr)`` over the row and
 column blocks::
@@ -34,18 +36,27 @@ work-item ``col`` at register component ``row`` -- so a fragment flows from
 ``block_read`` to ``T.opencl.tile.dpas`` to ``block_write`` with the same view.
 What a word holds depends on the variant:
 
-========================================  ======  ======================================
-Builtin                                   Word    Word ``(q, i)`` of a block at (y, x)
-========================================  ======  ======================================
-``read_16b_{1,2,4,8,16,32}r16x1c``        16-bit  ``M[y+q][x+i]``
-``read_8b_{1,2,4,8,16,32}r32x1c``         16-bit  ``M[y+q][x+2i]``, ``M[y+q][x+2i+1]``
-``read_transform_16b_{16,32}r16x1c``      32-bit  ``M[y+2q][x+i]``, ``M[y+2q+1][x+i]``
-``read_transform_8b_32r16x1c``            32-bit  ``M[y+4q+t][x+i]`` for ``t`` in 0..3
-``write_32b_{1,2,4,8}r16x1c``             32-bit  ``M[y+q][x+i]``
-``write_16b_{1,2,4,8}r16x1c``             16-bit  ``M[y+q][x+i]``
-========================================  ======  ======================================
+==========================================  ======  ======================================
+Builtin                                     Word    Word ``(q, i)`` of a block at (y, x)
+==========================================  ======  ======================================
+``read_16b_{1,2,4,8,16,32}r16x{1,2}c``      16-bit  ``M[y+q][x+i]``
+``read_8b_{1,2,4,8,16,32}r32x1c``           16-bit  ``M[y+q][x+2i]``, ``M[y+q][x+2i+1]``
+``read_32b_{1,2,4,8,16,32}r16x1c``          32-bit  ``M[y+q][x+i]``
+``read_transform_16b_{16,32}r16x{1,2}c``    32-bit  ``M[y+2q][x+i]``, ``M[y+2q+1][x+i]``
+``read_transform_8b_32r16x1c``              32-bit  ``M[y+4q+t][x+i]`` for ``t`` in 0..3
+``read_transpose_32b_16r8x1c``              32-bit  ``M[y+i][x+q]``
+``write_32b_{1,2,4,8}r16x1c``               32-bit  ``M[y+q][x+i]``
+``write_16b_{1,2,4,8}r16x1c``               16-bit  ``M[y+q][x+i]``
+==========================================  ======  ======================================
 
-Packed words list their elements from the low bits.  The plain reads produce the
+Packed words list their elements from the low bits.  A two-block (``x2c``)
+form moves blocks side by side and puts the second block's words straight after
+the first's; the register operand still has one atom per 16-column block, so a
+view reads the same at either width, and the two blocks' registers must be
+consecutive.  The transposed read hands work-item ``i`` row ``i`` of a 16 x 8
+block of 32-bit words, which for a ``(N, K)`` matrix of 16-bit values viewed as
+words is exactly the VNNI ``B`` fragment of ``B^T``.  The 32-row transposed read
+does not follow that mapping and is not accepted.  The plain reads produce the
 DPAS ``A`` fragment and the transforms the VNNI-packed ``B`` fragment, in
 hardware.  Each variant was checked on an Arc Pro B60 against the reference
 block; no others are accepted.
@@ -81,6 +92,7 @@ from tvm_tirx.tirx.tile.instruction import Instruction, Operand
 
 from ._publish import publish
 from .fragment import (
+    SUB_GROUP_SIZE,
     Fragment,
     check_disjoint,
     context_analyzer,
@@ -89,19 +101,22 @@ from .fragment import (
 )
 
 _NAME = re.compile(
-    r"^intel_sub_group_2d_block_(read|read_transform|write|prefetch)_(8|16|32)b_"
+    r"^intel_sub_group_2d_block_(read|read_transform|read_transpose|write|prefetch)_(8|16|32)b_"
     r"(\d+)r(\d+)x(\d+)c$"
 )
 
 _ROWS = (1, 2, 4, 8, 16, 32)
 # (kind, element bits) -> (rows, block columns, blocks per instruction) the hardware
-# was checked with.  Prefetch is also checked at two blocks wide, which halves the
-# instructions a K step needs; the reads and writes are checked at one.
+# was checked with.  Two-block forms place block 0's words before block 1's.
 VERIFIED = {
-    ("read", 16): (_ROWS, 16, (1,)),
+    ("read", 16): (_ROWS, 16, (1, 2)),
     ("read", 8): (_ROWS, 32, (1,)),
-    ("read_transform", 16): ((16, 32), 16, (1,)),
+    ("read", 32): (_ROWS, 16, (1,)),
+    ("read_transform", 16): ((16, 32), 16, (1, 2)),
     ("read_transform", 8): ((32,), 16, (1,)),
+    # Work-item i holds block row i, component c its column c.  The 32-row form
+    # exists but does not follow that mapping, so it is not accepted.
+    ("read_transpose", 32): ((16,), 8, (1,)),
     ("write", 32): ((1, 2, 4, 8), 16, (1,)),
     ("write", 16): ((1, 2, 4, 8), 16, (1,)),
     ("prefetch", 16): (_ROWS, 16, (1, 2)),
@@ -118,14 +133,20 @@ class Variant:
     kind: str
     bits: int  # element bits in global memory
     rows: int  # block rows in global memory
-    cols: int  # columns one instruction covers in global memory, in elements
-    words: int  # register words per work-item; 0 for a prefetch
+    block_cols: int  # columns of one block in global memory, in elements
+    blocks: int  # blocks one instruction moves, side by side
+    words: int  # register words per work-item per block; 0 for a prefetch
     word_bits: int
+
+    @property
+    def cols(self):
+        """Columns one instruction covers, across all its blocks."""
+        return self.block_cols * self.blocks
 
     @property
     def direction(self):
         """``read``, ``write`` or ``prefetch``: the instruction this builtin belongs to."""
-        return {"read_transform": "read"}.get(self.kind, self.kind)
+        return "read" if self.kind.startswith("read") else self.kind
 
     @property
     def is_read(self):
@@ -141,16 +162,17 @@ def variant(name):
     allowed = VERIFIED.get((kind, bits))
     if allowed is None or rows not in allowed[0] or cols != allowed[1] or blocks not in allowed[2]:
         raise ValueError(f"{name}: this 2D block variant has not been verified")
-    cols *= blocks
     if kind == "prefetch":
         word_bits, words = 0, 0
     elif kind == "read_transform":
         word_bits, words = 32, rows * bits // 32
+    elif kind == "read_transpose":
+        word_bits, words = 32, cols * rows // SUB_GROUP_SIZE
     elif kind == "read":
         word_bits, words = 16 if bits <= 16 else 32, rows
     else:
         word_bits, words = bits, rows
-    return Variant(name, kind, bits, rows, cols, words, word_bits)
+    return Variant(name, kind, bits, rows, cols, blocks, words, word_bits)
 
 
 class _Surface:
@@ -162,8 +184,8 @@ class _Surface:
         tensor, ty = region.source, region.source.ty
         if ty.scope != MemoryScope("global"):
             raise ValueError(f"global operand: expected global memory, got {ty.scope}")
-        if len(ty.shape) != 2:
-            raise ValueError(f"global operand: expected a 2D tensor, got shape {tuple(ty.shape)}")
+        if len(ty.shape) < 2:
+            raise ValueError(f"global operand: expected a matrix, got shape {tuple(ty.shape)}")
         dtype = ty.dtype.dtype
         if dtype.bits != var.bits or dtype.lanes != 1:
             raise ValueError(
@@ -171,22 +193,29 @@ class _Surface:
             )
         self.analyzer, self.tensor, self.resolve = analyzer, tensor, resolve
         nbytes = var.bits // 8
+        # Leading axes pick one matrix out of a batch; the block moves within it.
+        *lead, rows_axis, cols_axis = region.region
+        for r in lead:
+            if int(analyzer.simplify(r.extent)) != 1:
+                raise ValueError(
+                    "global operand: a block moves within one matrix; leading axes "
+                    "must have extent 1"
+                )
+        lead = [analyzer.simplify(r.begin) for r in lead]
 
         layout = ty.effective_layout()
         if layout is None:
             raise ValueError("global operand: requires a physical layout")
 
         def offset(row, col):
-            physical = dict(
-                layout.apply(IntImm("int32", row), IntImm("int32", col), shape=ty.shape)
-            )
+            coords = (*lead, IntImm("int32", row), IntImm("int32", col))
+            physical = dict(layout.apply(*coords, shape=ty.shape))
             if set(physical) - {"m"}:
                 raise ValueError("global operand: layout must address memory only")
             return analyzer.simplify(physical["m"])
 
         origin = offset(0, 0)
         row_stride = analyzer.simplify(offset(1, 0) - origin)
-        self._require(origin == 0, "tensor must start at its storage base")
         self._require(offset(0, 1) - origin == 1, "rows must be contiguous")
         self.pitch = analyzer.simplify(row_stride * nbytes)
         self._require(
@@ -198,11 +227,21 @@ class _Surface:
                 f"global operand: tensor must be at least {BASE_ALIGNMENT}-byte aligned, "
                 f"got {ty.data_alignment}"
             )
-        self.width = analyzer.simplify(ty.shape[1] * nbytes)
-        self.height = ty.shape[0]
+        # The matrix's first element is the surface base, so its byte offset from
+        # the aligned tensor base must keep that alignment.
+        self._require(
+            origin * nbytes % BASE_ALIGNMENT == 0,
+            f"matrix start must be {BASE_ALIGNMENT}-byte aligned",
+        )
+        if analyzer.can_prove(resolve(origin == 0)):
+            self.base = tensor.data
+        else:
+            self.base = tensor.ptr_to([*lead, IntImm("int32", 0), IntImm("int32", 0)])
+        self.width = analyzer.simplify(ty.shape[-1] * nbytes)
+        self.height = ty.shape[-2]
 
-        self.y0, self.x0 = (analyzer.simplify(r.begin) for r in region.region)
-        self.extent = tuple(int(analyzer.simplify(r.extent)) for r in region.region)
+        self.y0, self.x0 = (analyzer.simplify(r.begin) for r in (rows_axis, cols_axis))
+        self.extent = tuple(int(analyzer.simplify(r.extent)) for r in (rows_axis, cols_axis))
         if self.extent[0] % var.rows or self.extent[1] % var.cols:
             raise ValueError(
                 f"global operand: region {self.extent} is not a whole number of "
@@ -255,7 +294,7 @@ def _lower_prefetch(view, sctx):
         for j in range(surface.extent[1] // var.cols):
             call = T.call_extern(
                 var.name,
-                surface.tensor.data,
+                surface.base,
                 width,
                 height,
                 pitch,
@@ -279,15 +318,26 @@ def _lower(view, sctx, direction):
     surface = _Surface(memory, var, analyzer, resolve)
     fragment = Fragment("registers", registers, var.words, analyzer, layout_analyzer)
     fragment.require_bits(var.word_bits, "words")
-    blocks = (surface.extent[0] // var.rows, surface.extent[1] // var.cols)
+    # One register atom per single-width block, so a view reads the same whether
+    # the instruction moves one block or two side by side.
+    blocks = (surface.extent[0] // var.rows, surface.extent[1] // var.block_cols)
     if fragment.repeats != blocks:
         raise ValueError(
             f"registers: global region {surface.extent} is {blocks} blocks of "
-            f"{var.rows} x {var.cols}, so expected repeats {blocks}, got {fragment.repeats}"
+            f"{var.rows} x {var.block_cols}, so expected repeats {blocks}, got {fragment.repeats}"
         )
     bases = {(i, j): fragment.base((i, j)) for i in range(blocks[0]) for j in range(blocks[1])}
     if var.is_read:
         check_disjoint(analyzer, list(bases.values()), var.words, "registers")
+    # A multi-block instruction fills its blocks' registers back to back.
+    for (i, j), base in bases.items():
+        if j % var.blocks:
+            first = bases[(i, j - j % var.blocks)]
+            if not analyzer.can_prove(base == first + (j % var.blocks) * var.words):
+                raise ValueError(
+                    f"registers: {name} moves {var.blocks} blocks into consecutive registers, "
+                    f"but block ({i}, {j}) does not follow block ({i}, {j - 1})"
+                )
 
     word = f"uint{var.word_bits}"
     width, height, pitch = (
@@ -295,13 +345,15 @@ def _lower(view, sctx, direction):
     )
     bindings, body = [], []
     for (i, j), base in bases.items():
+        if j % var.blocks:
+            continue
         call = T.call_extern(
             name,
-            surface.tensor.data,
+            surface.base,
             width,
             height,
             pitch,
-            surface.coordinate(var, i, j),
+            surface.coordinate(var, i, j // var.blocks),
             fragment.address(bindings, base, word),
             ty="void",
         )
