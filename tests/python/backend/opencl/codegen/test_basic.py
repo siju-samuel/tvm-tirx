@@ -14,7 +14,6 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-# ruff: noqa: E501
 import re
 
 import pytest
@@ -187,10 +186,14 @@ def test_opencl_type_casting():
     def check_type_casting(n, dtype):
         fun = tvm_tirx.compile(Module, target=target).mod
         assembly = fun.imports[0].inspect_source()
-        lcond = "convert_int4(((convert_uint4(((uint4)(((convert_int(get_local_id(0))) == 3), ((convert_int(get_local_id(0))) == 3), ((convert_int(get_local_id(0))) == 3), ((convert_int(get_local_id(0))) == 3)))))"
-        rcond = "(convert_uint4(((((int4)((((convert_int(get_local_id(0))) * 4))+(1*0), (((convert_int(get_local_id(0))) * 4))+(1*1), (((convert_int(get_local_id(0))) * 4))+(1*2), (((convert_int(get_local_id(0))) * 4))+(1*3))) % ((int4)(3, 3, 3, 3))) == ((int4)(1, 1, 1, 1))))))))"
-        pattern_cond = f"({lcond} && {rcond})"
-        assert assembly.count(pattern_cond) != 0
+        # The mask must be widened before `&&` and converted for select: OpenCL
+        # vector comparisons yield signed lanes, and select needs an integer mask
+        # of the data's width.  Match that structure, not the operands, which
+        # common-subexpression elimination is free to bind to temporaries.
+        select = next(line for line in assembly.splitlines() if "select(" in line)
+        assert re.search(r"convert_int4\(\(\(convert_uint4\(.*\)\) && \(convert_uint4\(", select), (
+            select
+        )
 
         def run_and_check():
             dev = tvm_tirx.opencl(0)
