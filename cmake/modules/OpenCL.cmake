@@ -24,6 +24,9 @@ if(TVM_TIRX_USE_OPENCL)
     file(GLOB OPENCL_WRAPPER_SRCS CONFIGURE_DEPENDS "src/backend/opencl/runtime/opencl_wrapper/opencl_wrapper.cc"
     )
     list(APPEND RUNTIME_OPENCL_SRCS ${OPENCL_WRAPPER_SRCS})
+    # The wrapper loads the OpenCL library with dlopen, which glibc before 2.34 -- the
+    # manylinux_2_28 baseline release wheels build against -- keeps in libdl.
+    list(APPEND _opencl_libs ${CMAKE_DL_LIBS})
     find_path(TVM_OPENCL_HEADERS_DIR CL/cl.h
       HINTS "${TVM_OPENCL_HEADERS_ROOT}" ENV OPENCL_SDK
       PATH_SUFFIXES include)
