@@ -404,4 +404,15 @@ target's ``build_options``.
 
 On the B60 the ``64 x 32`` kernel computes ``4096``\ :sup:`3` at 88 TFLOP/s and
 ``2048``\ :sup:`3` at 71 TFLOP/s, against 67 and 63 TFLOP/s for the ``32 x 32``
-kernel and 1.5 and 2.0 TFLOP/s for scalar FMA.
+kernel and 1.5 and 2.0 TFLOP/s for scalar FMA. Intel's oneDNN, through
+``torch.matmul`` on the same machine, reaches 93 and 80 TFLOP/s, so the kernel
+runs at 95% and 89% of it.
+
+Two directions do not close that gap. A ``64 x 64`` tile cannot fit: its float32
+accumulator alone is 256 values per work-item, the entire large register file.
+Staging tiles through shared local memory mainly saves global traffic that
+sub-groups of a work-group repeat, and removing that duplication outright, by
+splitting the prefetch so each tile is fetched once per work-group, gained
+nothing measurable: the shared tiles already hit in cache. oneDNN generates GPU
+instructions directly, while this kernel goes through OpenCL C and the driver's
+compiler, which is where the remaining difference most likely lies.
