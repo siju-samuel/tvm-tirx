@@ -119,6 +119,14 @@ For CUDA tests, add `--group cuda` to the sync command above:
 uv run --no-sync pytest -v tests/python -m gpu
 ```
 
+Intel GPU tests run through OpenCL. Build with `-DTVM_TIRX_USE_OPENCL=ON`; the
+vendor's OpenCL runtime is enough, without an SDK. On a machine with an Intel GPU,
+run them with:
+
+```bash
+./tests/scripts/task_python_unittest_intel_gpu.sh
+```
+
 Start with the tests for the changed component. Device and architecture skips
 describe missing coverage; they do not demonstrate that a backend works.
 
@@ -221,8 +229,9 @@ GitHub Actions runs macOS and Windows checks and a separate lint workflow.
 Jenkins uses `ci/jenkins/jenkinsfile.groovy` for parallel ARM, GPU, and EXTRA
 branches. GPU builds one CUDA wheel for CPU tests, GPU tests, and documentation. ARM runs
 the Rust unit tests; CUDA queries are skipped when its runtime is unavailable.
-EXTRA builds alternate GPU backends without tests. Executable entry points are
-in `tests/scripts/`.
+EXTRA builds alternate GPU backends without tests. No runner has an Intel GPU;
+`tests/scripts/task_python_unittest_intel_gpu.sh` is the entry point for one, and
+fails rather than skips without one. Executable entry points are in `tests/scripts/`.
 
 ## Further reading
 
