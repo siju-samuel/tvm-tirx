@@ -66,7 +66,7 @@ matters: in an fp16 GEMM on the B60, prefetching the next K step gained 25% and
 prefetching two steps ahead lost about as much.
 
 As with the DPAS instruction, all 16 work-items of the sub-group must reach the
-call, which TIRx does not yet check on OpenCL.
+call, which TileDispatch proves before lowering it.
 """
 
 import re
@@ -80,7 +80,13 @@ from tvm_tirx.sym import Analyzer
 from tvm_tirx.tirx.tile.instruction import Instruction, Operand
 
 from ._publish import publish
-from .fragment import Fragment, check_disjoint, context_analyzer, require_intel_target
+from .fragment import (
+    Fragment,
+    check_disjoint,
+    context_analyzer,
+    require_converged,
+    require_intel_target,
+)
 
 _NAME = re.compile(
     r"^intel_sub_group_2d_block_(read|read_transform|write|prefetch)_(8|16|32)b_"
@@ -238,6 +244,7 @@ def _lower_prefetch(view, sctx):
     instruction, src = view.args
     var = _checked_variant(instruction, "prefetch")
     require_intel_target(sctx.target, "block_prefetch")
+    require_converged(sctx, "block_prefetch")
     analyzer, _, resolve = context_analyzer(sctx)
     surface = _Surface(src, var, analyzer, resolve)
     width, height, pitch = (
@@ -264,6 +271,7 @@ def _lower(view, sctx, direction):
     var = _checked_variant(instruction, direction)
     name = var.name
     require_intel_target(sctx.target, f"block_{direction}")
+    require_converged(sctx, f"block_{direction}")
     registers, memory = (dst, src) if var.is_read else (src, dst)
 
     analyzer, _, resolve = context_analyzer(sctx)

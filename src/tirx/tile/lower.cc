@@ -49,6 +49,7 @@
 #include <vector>
 
 #include "../../backend/cuda/tile/exec_analysis.h"
+#include "../../backend/opencl/tile/sub_group_convergence.h"
 
 namespace tvm {
 namespace tirx {
@@ -177,6 +178,9 @@ class TileDispatcher : public StmtExprMutator {
   explicit TileDispatcher(const Target& target) : target_(target) {}
 
   static Stmt LowerOpCalls(const Stmt& stmt, const Target& target) {
+    // Sub-group instructions are collectives: prove every work-item of a sub-group reaches each
+    // one before lowering it, as the CUDA execution analysis does for warp instructions.
+    if (target->kind->name == "opencl") backend::opencl::CheckSubGroupConvergence(stmt, target);
     return ffi::make_object<TileDispatcher>(target)
         ->Mutate(stmt, InplaceMode::kAllow)
         .ValueOrUnchanged(stmt);
@@ -497,6 +501,10 @@ class TileDispatcher : public StmtExprMutator {
       auto split = cuda_analysis_->Split(scope);
       inter_map = std::move(split.first);
       intra_map = std::move(split.second);
+    } else if (scope->backend() == "opencl" && scope->local_name() == "subgroup") {
+      // CheckSubGroupConvergence has proved every work-item of the sub-group is active here.
+      int64_t size = target_->GetAttr<int64_t>("thread_warp_size", 1).value();
+      intra_map.Set("sglid", {IntImm::Int32(size), IntImm::Int32(0)});
     }
     tile::DispatchContext sctx(target_, scope, launch_params_, var_range_map_,
                                /*alloc_only=*/false, /*callbacks=*/{}, shared_state_, inter_map,

@@ -198,6 +198,21 @@ def require_intel_target(target, what):
         )
 
 
+def require_converged(sctx, what):
+    """Confirm TileDispatch proved the whole sub-group reaches this instruction.
+
+    TileDispatch runs that proof for every OpenCL sub-group instruction before
+    lowering it, and records the active work-items as ``intra["sglid"]``, the way
+    CUDA's execution analysis records ``laneid`` for warp instructions.  Checking
+    it here keeps an instruction from lowering on a path that skipped the proof.
+    """
+    active = sctx.intra.get("sglid")
+    if active is None or [int(x) for x in active] != [SUB_GROUP_SIZE, 0]:
+        raise ValueError(
+            f"{what} requires all {SUB_GROUP_SIZE} work-items of the sub-group to be active"
+        )
+
+
 def check_disjoint(analyzer, bases, width, name):
     """Distinct repeats must write distinct registers, or one result overwrites another."""
     for i, first in enumerate(bases):

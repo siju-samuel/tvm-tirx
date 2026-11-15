@@ -48,11 +48,10 @@ established by running each builtin on an Arc Pro B60 against a reference
 product.
 
 Like every sub-group collective, the instruction requires all 16 work-items of
-the sub-group to reach it.  OpenCL has no execution analysis in TIRx yet, so
-unlike CUDA's warp instructions this is not checked: the call must be in
-sub-group-uniform control flow, in a work-group whose x extent is a multiple of
-16.  The same contract already applies to the sub-group shuffles that thread
-reductions lower to on this target.
+the sub-group to reach it.  TileDispatch proves that before lowering, as CUDA's
+execution analysis does for warp instructions: the work-group's x extent must
+be a multiple of 16, and no enclosing condition, loop bound or early exit may
+treat work-items of one sub-group differently.
 """
 
 from itertools import product
@@ -64,7 +63,13 @@ from tvm_tirx.sym import Analyzer
 from tvm_tirx.tirx.tile.instruction import Instruction, Operand
 
 from ._publish import publish
-from .fragment import Fragment, check_disjoint, require_intel_target, vector_type
+from .fragment import (
+    Fragment,
+    check_disjoint,
+    require_converged,
+    require_intel_target,
+    vector_type,
+)
 
 M_CHOICES = (1, 2, 4, 8)
 B_WORDS = 8  # 32-bit words of B per work-item: K * bits(element) / 32.
@@ -92,6 +97,7 @@ def lower(view, sctx):
     if name not in FAMILIES:
         raise ValueError(f"Unknown dpas instruction {name!r}; expected one of {sorted(FAMILIES)}")
     require_intel_target(sctx.target, "dpas")
+    require_converged(sctx, "dpas")
     a_word, b_word, accumulators = FAMILIES[name]
 
     analyzer, layout_analyzer = Analyzer(), Analyzer()

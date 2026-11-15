@@ -193,13 +193,21 @@ that the accumulator type suits the builtin, and that the target is an Intel
 part with a declared sub-group size of 16. A fragment that disagrees with the
 hardware fails to compile with the reason, instead of returning wrong numbers.
 
-The check covers the instruction, not the code that fills the registers. The
-loads in the example index by ``lane``, and the lowering takes on trust that the
-loaded values match the layout. Like every sub-group collective, the instruction
-also requires all 16 work-items of the sub-group to reach it. TIRx has no
-OpenCL execution analysis yet, so this is not checked either: call it in
-sub-group-uniform control flow, in a work-group whose x extent is a multiple
-of 16.
+Like every sub-group collective, the instruction requires all 16 work-items of
+the sub-group to reach it, and ``TileDispatch`` proves that before lowering, as
+it does for CUDA warp instructions. The work-group's x extent must be a multiple
+of 16, and nothing on the way to the call may treat work-items of one sub-group
+differently: not an enclosing condition, in either branch, nor a loop bound, nor
+a ``break``, ``continue`` or ``return``. A condition is proved uniform rather
+than recognized, so ``if tx // 16 < 2`` is accepted and ``if tx % 16 < 8`` is
+rejected with the condition named. A condition that reads private memory counts
+as divergent even at a uniform index, since each work-item reads its own
+register.
+
+The check covers the instruction, not scalar code that fills the registers.
+The loads in the example index by ``lane``, and the lowering takes on trust that
+the loaded values match the layout; the block reads below are checked end to
+end.
 
 Loading Fragments with 2D Block Reads
 -------------------------------------
