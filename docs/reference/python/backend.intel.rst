@@ -37,6 +37,7 @@ Namespaces
 * :doc:`tvm_tirx.backend.intel.target_tags <backend.intel.target_tags>`
 * :doc:`tvm_tirx.backend.intel.tile.block_io <backend.intel.tile.block_io>`
 * :doc:`tvm_tirx.backend.intel.tile.dpas <backend.intel.tile.dpas>`
+* :doc:`tvm_tirx.backend.intel.tile.ewise <backend.intel.tile.ewise>`
 
 .. toctree::
    :hidden:
@@ -46,3 +47,4 @@ Namespaces
    backend.intel.target_tags
    backend.intel.tile.block_io
    backend.intel.tile.dpas
+   backend.intel.tile.ewise

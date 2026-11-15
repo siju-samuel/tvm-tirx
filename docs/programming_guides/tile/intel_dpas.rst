@@ -305,6 +305,40 @@ the selected matrix starts 4-byte aligned. The register view's repeats are
 ``(N blocks, K blocks)``, which is the transpose of DPAS's ``(Kr, Nr)``, so the
 same registers are passed to ``dpas`` as ``br.view(1, 2, 8, 16, ...)``.
 
+Epilogues
+---------
+
+``T.opencl.tile.ewise(function, dst, *inputs, scope="subgroup")`` applies a
+scalar ``@T.function`` at every coordinate of a register fragment, so a bias, a
+scale or an activation runs on the accumulator before the block write stores it:
+
+.. code-block:: python
+
+    @T.function(private=True)
+    def scale_bias_relu(acc: T.float32, bias: T.float32, alpha: T.float32) -> T.float32:
+        return T.max(acc * alpha + bias, T.float32(0))
+
+    # bias[j] holds this work-item's column of output block j; stride 0 on the row
+    # axes presents it as the whole tile.
+    for j in range(2):
+        bias[j] = Bias[col0 + j * 16 + lane]
+    T.opencl.tile.ewise(
+        scale_bias_relu,
+        dr.view(4, 2, 8, 16, layout=fragment(4, 2, 8)),
+        dr.view(4, 2, 8, 16, layout=fragment(4, 2, 8)),
+        bias.view(4, 2, 8, 16, layout=TileLayout(S[(4, 2, 8, 16) : (0, 1, 0, 1 @ sglid)])),
+        T.float32(0.5),
+        scope="subgroup",
+    )
+
+Each work-item updates only the elements it holds, with no data moving between
+work-items. Lowering checks, coordinate by coordinate, that every input holds
+each coordinate on the same work-item as ``dst`` and at a register that does not
+depend on which work-item it is, and rejects a call that would need data from
+another work-item. Because nothing is exchanged, the call is safe under control
+flow that differs within a sub-group, but only at ``scope="thread"``: at
+``"subgroup"`` it is held to the collectives' convergence proof.
+
 Larger Tiles
 ------------
 
