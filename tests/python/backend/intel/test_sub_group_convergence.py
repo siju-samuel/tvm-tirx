@@ -26,12 +26,14 @@ import pytest
 
 import tvm_tirx
 import tvm_tirx.testing
+from tvm_tirx.backend.intel.target_tags import device_tag
 from tvm_tirx.backend.opencl.axis import sglid
 from tvm_tirx.script import ir as I
 from tvm_tirx.script import tirx as T
 from tvm_tirx.tirx.layout import S, TileLayout
 
-TARGET = "intel/arc-b60-opencl"
+# The tag of the Intel GPU these run on, so each tagged part is tested with its own limits.
+TARGET = device_tag() or "intel/arc-b60-opencl"
 F16 = "intel_sub_group_f16_f16_matrix_mad_k16"
 FRAG = TileLayout(S[(1, 1, 8, 16) : (8, 8, 1, 1 @ sglid)])
 

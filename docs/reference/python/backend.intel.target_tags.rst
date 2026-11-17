@@ -20,3 +20,14 @@ tvm_tirx.backend.intel.target_tags
 
 .. automodule:: tvm_tirx.backend.intel.target_tags
    :no-members:
+
+.. currentmodule:: tvm_tirx.backend.intel.target_tags
+
+Functions
+---------
+
+.. autosummary::
+   :toctree: generated/
+
+   device_tag
+   tag_for_device_name

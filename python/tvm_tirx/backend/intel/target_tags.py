@@ -42,8 +42,14 @@ work-items have 128 registers by default or 256 in large-register mode, which
 halves how many threads a core keeps resident.  A kernel whose live state does
 not fit in 128 spills, and a large matrix tile then runs over 30x slower; but
 forcing 256 everywhere costs a kernel that fits a third of its speed.  IGC's
-automatic mode takes 256 only for a kernel that would otherwise spill, which
-on an Arc Pro B60 matched the faster fixed mode for both kinds of kernel.
+automatic mode takes a larger file only for a kernel that would otherwise
+spill, which on an Arc Pro B60 matched the faster fixed mode for both kinds of
+kernel.
+
+Importing this module also registers a device detector, so
+``Target.from_device`` on a tagged part returns its tag rather than a target
+built from the device query, whose ``thread_warp_size`` of 1 would turn the
+sub-group lowering off.  ``device_tag`` names the tag of an OpenCL device.
 """
 
 from __future__ import annotations
@@ -79,3 +85,83 @@ _register_intel_opencl_tag("intel/xe-opencl", max_threads=1024, shared_mem=65536
 # Arc Pro B60 (Battlemage, BMG): 160 Xe cores, 128 KiB SLM, 1024 threads per
 # work-group.  Verified with clinfo on an Arc Pro B60.
 _register_intel_opencl_tag("intel/arc-b60-opencl", max_threads=1024, shared_mem=131072)
+
+# How each tagged part names itself through OpenCL.
+_DEVICE_NAMES = {
+    "intel/arc-b60-opencl": ("Arc(TM) Pro B60",),
+}
+
+
+def tag_for_device_name(name):
+    """The ``intel/*`` tag of the part an OpenCL device name belongs to.
+
+    Parameters
+    ----------
+    name : str or None
+        The device name OpenCL reports, such as ``tvm_tirx.opencl(0).device_name``.
+
+    Returns
+    -------
+    tag : str or None
+        The tag, or None for a part that has none.
+    """
+    for tag, needles in _DEVICE_NAMES.items():
+        if any(needle in (name or "") for needle in needles):
+            return tag
+    return None
+
+
+def device_tag(index=0):
+    """The ``intel/*`` tag of an OpenCL device.
+
+    Parameters
+    ----------
+    index : int, optional
+        The OpenCL device index.
+
+    Returns
+    -------
+    tag : str or None
+        The tag, or None when there is no such device, no OpenCL runtime in this
+        build, or the device is not a tagged part.
+    """
+    import tvm_tirx  # pylint: disable=import-outside-toplevel
+
+    try:
+        device = tvm_tirx.opencl(index)
+        if not device.exist:
+            return None
+        return tag_for_device_name(device.device_name)
+    except Exception:  # pylint: disable=broad-except
+        # No OpenCL runtime in this build, or no driver on this machine.
+        return None
+
+
+def _install_device_detector():
+    """Detect a tagged Intel part as its tag, so it gets the sub-group width and limits.
+
+    The generic OpenCL detector builds a target from what the device reports, which
+    leaves ``thread_warp_size`` at 1 and so keeps the sub-group lowering off.  Any
+    other device still goes to that detector, which exists by now: the Intel
+    backend loads the opencl backend before it imports this module.
+    """
+    from tvm_tirx.target import Target  # pylint: disable=import-outside-toplevel
+    from tvm_tirx.target.detect_target import (  # pylint: disable=import-outside-toplevel
+        SUPPORTED_DEVICE,
+        register_device_target_detector,
+    )
+
+    generic = SUPPORTED_DEVICE.get("opencl")
+
+    def detect(dev):
+        tag = tag_for_device_name(dev.device_name)
+        if tag is not None:
+            return Target(tag)
+        if generic is None:
+            raise ValueError(f"No target detector for OpenCL device {dev.device_name!r}")
+        return generic(dev)
+
+    register_device_target_detector("opencl", detect)
+
+
+_install_device_detector()

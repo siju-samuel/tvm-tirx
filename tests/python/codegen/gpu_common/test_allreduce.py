@@ -21,13 +21,14 @@ import tvm_ffi
 
 import tvm_tirx
 import tvm_tirx.testing
+from tvm_tirx.backend.intel import target_tags as intel_target_tags
 from tvm_tirx.script import ir as I
 from tvm_tirx.script import tirx as T
 from tvm_tirx.testing import env
 
 # A Target rather than a tag string, because device_enabled only resolves a
 # runtime from a bare kind name.
-_INTEL_OPENCL = tvm_tirx.target.Target("intel/arc-b60-opencl")
+_INTEL_OPENCL = tvm_tirx.target.Target(intel_target_tags.device_tag() or "intel/arc-b60-opencl")
 
 
 def _reduce_module(d1, d2, d3, is_max=False):

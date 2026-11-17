@@ -27,6 +27,7 @@ import tvm_ffi
 
 import tvm_tirx
 import tvm_tirx.testing
+from tvm_tirx.backend.intel.target_tags import device_tag
 from tvm_tirx.backend.intel.tile.block_io import VERIFIED, variant
 from tvm_tirx.backend.opencl.axis import sglid
 from tvm_tirx.script import ir as I
@@ -34,7 +35,8 @@ from tvm_tirx.script import tirx as T
 from tvm_tirx.testing import env
 from tvm_tirx.tirx.layout import S, TileLayout
 
-TARGET = "intel/arc-b60-opencl"
+# The tag of the Intel GPU these run on, so each tagged part is tested with its own limits.
+TARGET = device_tag() or "intel/arc-b60-opencl"
 ROWS, PITCH_BYTES = 64, 256
 
 

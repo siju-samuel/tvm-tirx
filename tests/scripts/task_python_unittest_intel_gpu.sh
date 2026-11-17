@@ -32,11 +32,13 @@ uv run --no-sync python - <<'PY'
 import sys
 
 import tvm_tirx
+from tvm_tirx.backend.intel.target_tags import device_tag
 
 device = tvm_tirx.opencl(0)
 if not device.exist or "Intel" not in (device.device_name or ""):
     sys.exit("No Intel OpenCL GPU is visible; the Intel GPU tests would only be skipped.")
-print(f"Intel GPU tests on {device.device_name}")
+# An untagged part is tested with the B60's tag.
+print(f"Intel GPU tests on {device.device_name}, as {device_tag() or 'intel/arc-b60-opencl'}")
 PY
 
 if [ "$#" -eq 0 ]; then

@@ -19,6 +19,7 @@ import pytest
 import tvm_tirx
 import tvm_tirx.testing
 from tvm_tirx.target import Target
+from tvm_tirx.testing import env
 
 
 @pytest.mark.parametrize("tag", ["intel/xe-opencl", "intel/arc-b60-opencl"])
@@ -56,6 +57,38 @@ def test_intel_tag_lets_the_compiler_choose_the_register_file():
     for tag in ("intel/arc-b60-opencl", "intel/xe-opencl"):
         assert Target(tag).attrs["build_options"] == "-cl-intel-enable-auto-large-GRF-mode"
     assert "build_options" not in Target("opencl").attrs
+
+
+@pytest.mark.parametrize(
+    "name, tag",
+    [
+        ("Intel(R) Arc(TM) Pro B60 Graphics", "intel/arc-b60-opencl"),
+        ("QUALCOMM Adreno(TM) 740", None),
+    ],
+)
+def test_device_name_selects_its_tag(name, tag):
+    from tvm_tirx.backend.intel.target_tags import tag_for_device_name
+
+    assert tag_for_device_name(name) == tag
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not env.has_opencl(), reason="need opencl")
+def test_tag_matches_the_device_it_detects():
+    """On a tagged part, detection yields its tag, and the tag's limits are what the
+    hardware reports: the check that catches a wrong tag."""
+    from tvm_tirx.backend.intel.target_tags import device_tag
+
+    tag = device_tag()
+    if tag is None:
+        pytest.skip("not a tagged Intel GPU")
+    device = tvm_tirx.opencl(0)
+    target = Target(tag)
+    assert target.attrs["max_shared_memory_per_block"] == device.max_shared_memory_per_block
+    assert target.attrs["max_threads_per_block"] == device.max_threads_per_block
+    detected = Target.from_device(device)
+    assert int(detected.attrs["thread_warp_size"]) == 16
+    assert int(detected.attrs["max_shared_memory_per_block"]) == device.max_shared_memory_per_block
 
 
 def test_intel_backend_is_autoloaded():
