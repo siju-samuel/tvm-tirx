@@ -35,6 +35,7 @@ python examples/intel_kernels/gemm.py --bench "2048^3"
 | Kernel | What it does |
 |---|---|
 | [`gemm.py`](gemm.py) | fp16 GEMM with float32 accumulation on DPAS; the leftover tiles of a partly full last wave are split along K |
+| [`attention.py`](attention.py) | FlashAttention prefill, head dimension 64, causal or not, with online softmax in registers |
 
 `tests/python/backend/intel/test_intel_kernels.py` runs the modules' correctness
 checks on an Intel GPU.

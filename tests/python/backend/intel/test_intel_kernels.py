@@ -88,5 +88,23 @@ def test_gemm(label, split):
     tvm_tirx.testing.run_with_gpu_lock(run_and_check)
 
 
+@pytest.mark.gpu
+@requires_intel_gpu
+@pytest.mark.parametrize("label", ["h8 l256 d64", "h8 l256 d64 causal"])
+def test_attention(label):
+    attention = _load("attention")
+    cfg = next(c for c in attention.CONFIGS if c["label"] == label)
+    data = attention.prepare_data(**cfg)
+    fun = tvm_tirx.compile(attention.get_kernel(**cfg), target=TARGET)
+
+    def run_and_check():
+        dev = tvm_tirx.opencl(0)
+        tensors = [tvm_tirx.runtime.tensor(data[k], dev) for k in ("Q", "Kw", "V", "O")]
+        fun["main"](*tensors)
+        attention.check_correctness(dict(data, O=tensors[3].numpy()), **cfg)
+
+    tvm_tirx.testing.run_with_gpu_lock(run_and_check)
+
+
 if __name__ == "__main__":
     tvm_tirx.testing.main()
