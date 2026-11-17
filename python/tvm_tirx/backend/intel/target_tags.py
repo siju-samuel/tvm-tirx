@@ -82,8 +82,9 @@ def _register_intel_opencl_tag(name: str, *, max_threads: int, shared_mem: int) 
 # is the smallest SLM budget across Xe-HPG and later discrete GPUs.
 _register_intel_opencl_tag("intel/xe-opencl", max_threads=1024, shared_mem=65536)
 
-# Arc Pro B60 (Battlemage, BMG): 160 Xe cores, 128 KiB SLM, 1024 threads per
-# work-group.  Verified with clinfo on an Arc Pro B60.
+# Arc Pro B60 (Battlemage, BMG): 20 Xe2 cores, 128 KiB SLM, 1024 threads per
+# work-group.  Verified with clinfo on an Arc Pro B60, whose 160 compute units are
+# the cores' vector engines, eight per core.
 _register_intel_opencl_tag("intel/arc-b60-opencl", max_threads=1024, shared_mem=131072)
 
 # How each tagged part names itself through OpenCL.
