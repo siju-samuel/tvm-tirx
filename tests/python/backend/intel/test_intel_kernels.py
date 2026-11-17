@@ -90,12 +90,13 @@ def test_gemm(label, split):
 
 @pytest.mark.gpu
 @requires_intel_gpu
+@pytest.mark.parametrize("keys", [16, 32])
 @pytest.mark.parametrize("label", ["h8 l256 d64", "h8 l256 d64 causal"])
-def test_attention(label):
+def test_attention(label, keys):
     attention = _load("attention")
     cfg = next(c for c in attention.CONFIGS if c["label"] == label)
     data = attention.prepare_data(**cfg)
-    fun = tvm_tirx.compile(attention.get_kernel(**cfg), target=TARGET)
+    fun = tvm_tirx.compile(attention.get_kernel(**cfg, keys=keys), target=TARGET)
 
     def run_and_check():
         dev = tvm_tirx.opencl(0)

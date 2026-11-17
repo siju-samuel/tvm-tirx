@@ -16,7 +16,7 @@
 # under the License.
 """FlashAttention prefill on Intel Xe DPAS: softmax(Q K^T / sqrt(d)) V, causal or not.
 
-Each sub-group owns 16 query rows of one head and walks the keys 16 at a time,
+Each sub-group owns 16 query rows of one head and walks the keys 32 at a time,
 keeping the output, the running row maximum and the running row sum in its
 registers, so the score matrix is never stored.  For each block of keys:
 
@@ -30,7 +30,7 @@ registers, so the score matrix is never stored.  For each block of keys:
   an A operand, and O += P V with V read by the transforming block read.
 
 At the end each row is divided by its sum.  With ``causal``, keys after the
-query are masked on the diagonal block, and blocks wholly after it are skipped.
+query are masked, and blocks wholly after it are skipped.
 
 The module follows TIRx-kernels' kernel protocol.
 """
@@ -60,7 +60,6 @@ CONFIGS = [
 ]
 
 ROWS = 16  # query rows per sub-group: two 8-row DPAS fragments
-KEYS = 16  # keys per step
 SUB_GROUPS = 8  # sub-groups per work-group
 F16 = "intel_sub_group_f16_f16_matrix_mad_k16"
 NEG = -1.0e30  # a masked score; exp(NEG - max) is 0
@@ -115,7 +114,7 @@ def _mask(s: T.float32, row: T.int32, col: T.int32) -> T.float32:
     return T.if_then_else(col > row, T.float32(NEG), s)
 
 
-def get_kernel(*, backend_config=None, heads, length, head_dim, causal, **_):
+def get_kernel(*, backend_config=None, heads, length, head_dim, causal, keys=32, **_):
     """The attention as an IRModule whose ``main(Q, Kw, V, Out)`` launches one kernel.
 
     Parameters
@@ -127,6 +126,9 @@ def get_kernel(*, backend_config=None, heads, length, head_dim, causal, **_):
         length must be a multiple of 16 and the head dimension 64.
     causal : bool
         Mask keys after each query.
+    keys : int
+        Keys per step, 32 (the default) or 16.  Each step's softmax bookkeeping
+        is the same, so 32 keys give it twice the DPAS work.
 
     Returns
     -------
@@ -139,22 +141,27 @@ def get_kernel(*, backend_config=None, heads, length, head_dim, causal, **_):
         raise ValueError("this kernel handles head_dim 64")
     if length % (ROWS * SUB_GROUPS) != 0:
         raise ValueError(f"length must be a multiple of {ROWS * SUB_GROUPS}")
-    D, KB = head_dim, head_dim // 16
+    if keys not in (16, 32):
+        raise ValueError("keys must be 16 or 32")
+    D, KB, NB = head_dim, head_dim // 16, keys // 16
     scale = 1.0 / math.sqrt(head_dim)
-    steps = length // KEYS
+    steps = length // keys
 
     q_read = _lay((1, KB, 16, 16), (KB * 16, 16, 1))  # Q: register kb * 16 + row
     q_dpas = _lay((2, KB, 8, 16), (8, 16, 1))
-    k_read = _lay((1, KB, 8, 16), (KB * 8, 8, 1))  # K^T: register kb * 8 + word
-    k_dpas = _lay((KB, 1, 8, 16), (8, 8, 1))
-    v_read = _lay((1, KB, 8, 16), (KB * 8, 8, 1))  # V: register nb * 8 + word
-    v_dpas = _lay((1, KB, 8, 16), (KB * 8, 8, 1))
-    s_lay = _lay((2, 1, 8, 16), (8, 8, 1))  # S and P: register frag * 8 + row
-    o_lay = _lay((2, KB, 8, 16), (KB * 8, 8, 1))  # O: register frag * 32 + nb * 8 + row
+    # K^T: key block nb, head-dimension block kb, word: register nb * KB * 8 + kb * 8 + word.
+    k_read = _lay((NB, KB, 8, 16), (KB * 8, 8, 1))
+    k_dpas = _lay((KB, NB, 8, 16), (8, KB * 8, 1))
+    # V: head-dimension block nb, then the key blocks' words: register nb * NB * 8 + word.
+    v_read = _lay((1, KB, NB * 8, 16), (KB * NB * 8, NB * 8, 1))
+    v_dpas = _lay((NB, KB, 8, 16), (8, NB * 8, 1))
+    s_lay = _lay((2, NB, 8, 16), (NB * 8, 8, 1))  # S and P: register frag * NB * 8 + nb * 8 + row
+    o_lay = _lay((2, KB, 8, 16), (KB * 8, 8, 1))  # O: register frag * KB * 8 + nb * 8 + row
     rows = _rows_layout((2, 1, 8, 1), (8, 8, 1, 1))
-    rows_as_s = _rows_layout((2, 1, 8, 16), (8, 0, 1, 0))
+    rows_as_s = _rows_layout((2, NB, 8, 16), (8, 0, 1, 0))
     rows_as_o = _rows_layout((2, KB, 8, 16), (8, 0, 1, 0))
-    cols_as_s = _lay((2, 1, 8, 16), (0, 0, 0))  # one key index per work-item
+    cols_as_s = _lay((2, NB, 8, 16), (0, 1, 0))  # each work-item's key index in each key block
+    v_name = f"intel_sub_group_2d_block_read_transform_16b_{keys}r16x1c"
 
     @I.ir_module
     class Module:
@@ -170,17 +177,17 @@ def get_kernel(*, backend_config=None, heads, length, head_dim, causal, **_):
                 with T.launch_thread("blockIdx.x", length // (ROWS * SUB_GROUPS)) as qb:
                     with T.launch_thread("threadIdx.x", SUB_GROUPS * 16) as tx:
                         q = T.alloc_local((KB * 16,), "float16")
-                        k = T.alloc_local((KB * 8,), "uint32")
-                        v = T.alloc_local((KB * 8,), "uint32")
-                        s = T.alloc_local((16,), "float32")
-                        p = T.alloc_local((16,), "float16")
+                        k = T.alloc_local((NB * KB * 8,), "uint32")
+                        v = T.alloc_local((NB * KB * 8,), "uint32")
+                        s = T.alloc_local((2 * NB * 8,), "float32")
+                        p = T.alloc_local((2 * NB * 8,), "float16")
                         o = T.alloc_local((2 * KB * 8,), "float32")
                         m = T.alloc_local((16,), "float32")
                         m_new = T.alloc_local((16,), "float32")
                         total = T.alloc_local((16,), "float32")
                         part = T.alloc_local((16,), "float32")
                         row_id = T.alloc_local((16,), "int32")
-                        col_id = T.alloc_local((1,), "int32")
+                        col_id = T.alloc_local((NB,), "int32")
                         lane = tx % 16
                         q0 = (qb * SUB_GROUPS + tx // 16) * ROWS
                         for e in range(16):
@@ -195,44 +202,47 @@ def get_kernel(*, backend_config=None, heads, length, head_dim, causal, **_):
                             Q[h, q0 : q0 + ROWS, 0:D],
                             scope="subgroup",
                         )
-                        for j in T.serial(q0 // KEYS + 1 if causal else steps, unroll=False):
-                            kv0 = j * KEYS
+                        for j in T.serial(
+                            (q0 + ROWS + keys - 1) // keys if causal else steps, unroll=False
+                        ):
+                            kv0 = j * keys
                             T.intel.tile.block_read(
                                 "intel_sub_group_2d_block_read_transpose_32b_16r8x1c",
-                                k.view(1, KB, 8, 16, layout=k_read),
-                                Kw[h, kv0 : kv0 + KEYS, 0 : D // 2],
+                                k.view(NB, KB, 8, 16, layout=k_read),
+                                Kw[h, kv0 : kv0 + keys, 0 : D // 2],
                                 scope="subgroup",
                             )
                             T.intel.tile.block_read(
-                                "intel_sub_group_2d_block_read_transform_16b_16r16x1c",
-                                v.view(1, KB, 8, 16, layout=v_read),
-                                V[h, kv0 : kv0 + KEYS, 0:D],
+                                v_name,
+                                v.view(1, KB, NB * 8, 16, layout=v_read),
+                                V[h, kv0 : kv0 + keys, 0:D],
                                 scope="subgroup",
                             )
-                            for e in range(16):
+                            for e in range(2 * NB * 8):
                                 s[e] = T.float32(0)
                             T.intel.tile.dpas(
                                 F16,
-                                s.view(2, 1, 8, 16, layout=s_lay),
+                                s.view(2, NB, 8, 16, layout=s_lay),
                                 q.view(2, KB, 8, 16, layout=q_dpas),
-                                k.view(KB, 1, 8, 16, layout=k_dpas),
-                                s.view(2, 1, 8, 16, layout=s_lay),
+                                k.view(KB, NB, 8, 16, layout=k_dpas),
+                                s.view(2, NB, 8, 16, layout=s_lay),
                                 scope="subgroup",
                             )
                             if causal:
-                                col_id[0] = kv0 + lane
+                                for nb in range(NB):
+                                    col_id[nb] = kv0 + nb * 16 + lane
                                 T.intel.tile.ewise(
                                     _mask,
-                                    s.view(2, 1, 8, 16, layout=s_lay),
-                                    s.view(2, 1, 8, 16, layout=s_lay),
-                                    row_id.view(2, 1, 8, 16, layout=rows_as_s),
-                                    col_id.view(2, 1, 8, 16, layout=cols_as_s),
+                                    s.view(2, NB, 8, 16, layout=s_lay),
+                                    s.view(2, NB, 8, 16, layout=s_lay),
+                                    row_id.view(2, NB, 8, 16, layout=rows_as_s),
+                                    col_id.view(2, NB, 8, 16, layout=cols_as_s),
                                 )
                             # The running maximum, and the rescaling of what came before.
                             T.intel.tile.reduce(
                                 "max",
                                 part.view(2, 1, 8, 1, layout=rows),
-                                s.view(2, 1, 8, 16, layout=s_lay),
+                                s.view(2, NB, 8, 16, layout=s_lay),
                             )
                             T.intel.tile.ewise(
                                 _maximum,
@@ -267,15 +277,15 @@ def get_kernel(*, backend_config=None, heads, length, head_dim, causal, **_):
                             # P = exp(S - max), its row sums, and O += P V.
                             T.intel.tile.ewise(
                                 _exp_scaled,
-                                s.view(2, 1, 8, 16, layout=s_lay),
-                                s.view(2, 1, 8, 16, layout=s_lay),
-                                m.view(2, 1, 8, 16, layout=rows_as_s),
+                                s.view(2, NB, 8, 16, layout=s_lay),
+                                s.view(2, NB, 8, 16, layout=s_lay),
+                                m.view(2, NB, 8, 16, layout=rows_as_s),
                                 T.float32(scale),
                             )
                             T.intel.tile.reduce(
                                 "sum",
                                 part.view(2, 1, 8, 1, layout=rows),
-                                s.view(2, 1, 8, 16, layout=s_lay),
+                                s.view(2, NB, 8, 16, layout=s_lay),
                             )
                             T.intel.tile.ewise(
                                 _rescale_sum,
@@ -286,14 +296,14 @@ def get_kernel(*, backend_config=None, heads, length, head_dim, causal, **_):
                             )
                             T.intel.tile.ewise(
                                 _to_half,
-                                p.view(2, 1, 8, 16, layout=s_lay),
-                                s.view(2, 1, 8, 16, layout=s_lay),
+                                p.view(2, NB, 8, 16, layout=s_lay),
+                                s.view(2, NB, 8, 16, layout=s_lay),
                             )
                             T.intel.tile.dpas(
                                 F16,
                                 o.view(2, KB, 8, 16, layout=o_lay),
-                                p.view(2, 1, 8, 16, layout=s_lay),
-                                v.view(1, KB, 8, 16, layout=v_dpas),
+                                p.view(2, NB, 8, 16, layout=s_lay),
+                                v.view(NB, KB, 8, 16, layout=v_dpas),
                                 o.view(2, KB, 8, 16, layout=o_lay),
                                 scope="subgroup",
                             )
