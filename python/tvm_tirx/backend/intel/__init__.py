@@ -18,7 +18,7 @@
 
 from importlib import import_module
 
-_LAZY_SUBMODULES = {"script", "target_tags", "tile"}
+_LAZY_SUBMODULES = {"occupancy", "script", "target_tags", "tile"}
 
 
 def register_backend():
@@ -41,4 +41,4 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-__all__ = ["register_backend", "script", "target_tags", "tile"]
+__all__ = ["occupancy", "register_backend", "script", "target_tags", "tile"]

@@ -417,7 +417,15 @@ Part of the difference at ``2048``\ :sup:`3` is the last wave of work-groups.
 A B60 runs 40 of these work-groups at a time, two per Xe core, and
 ``2048``\ :sup:`3` has 128 of them: three full waves and one a fifth full. On
 ``2560 x 2048 x 2048``, four full waves, the kernel reaches 85 TFLOP/s, 94% of
-oneDNN's 90 on the same shape.
+oneDNN's 90 on the same shape. :mod:`tvm_tirx.backend.intel.occupancy` computes
+these counts for a kernel's sub-groups, register mode and shared local memory:
+
+.. code-block:: python
+
+    from tvm_tirx.backend.intel.occupancy import ARC_B60, resident_work_groups, wave_efficiency
+
+    resident = resident_work_groups(ARC_B60, sub_groups=16, registers=256)  # 40
+    wave_efficiency((2048 // 256) * (2048 // 128), resident)  # 0.8
 
 Two directions do not close the rest. A ``64 x 64`` tile cannot fit: its float32
 accumulator alone is 256 values per work-item, the entire large register file.
