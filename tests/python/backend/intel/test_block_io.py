@@ -678,35 +678,35 @@ def _name_1d(kind, bits, n):
     )
 
 
-def _roundtrip_1d(bits, n, start):
-    """Read 16 * n elements of row 1 into registers, record the registers, write them back."""
-    dtype, count = _elem(bits), 16 * n
-    atom = frag(1, 1, n)
+def _roundtrip_1d(bits, n, start, runs=1):
+    """Read ``runs`` runs of 16 * n elements of row 1 into registers, record, and write back."""
+    dtype, count = _elem(bits), 16 * n * runs
+    atom = frag(1, runs, n)
 
     @I.ir_module
     class Module:
         @T.function
         def main(
             Src: T.Tensor((2, 512), dtype),
-            Regs: T.Tensor((n, 16), dtype),
+            Regs: T.Tensor((runs * n, 16), dtype),
             Dst: T.Tensor((2, 512), dtype),
         ):
             T.func_attr({"tirx.noalias": True})
             with T.launch_thread("blockIdx.x", 1):
                 with T.launch_thread("threadIdx.x", 16) as lane:
-                    r = T.alloc_local((n,), dtype)
+                    r = T.alloc_local((runs * n,), dtype)
                     T.intel.tile.block_read(
                         _name_1d("read", bits, n),
-                        r.view(1, 1, n, 16, layout=atom),
+                        r.view(1, runs, n, 16, layout=atom),
                         Src[1, start : start + count],
                         scope="subgroup",
                     )
-                    for c in range(n):
+                    for c in range(runs * n):
                         Regs[c, lane] = r[c]
                     T.intel.tile.block_write(
                         _name_1d("write", bits, n),
                         Dst[1, start : start + count],
-                        r.view(1, 1, n, 16, layout=atom),
+                        r.view(1, runs, n, 16, layout=atom),
                         scope="subgroup",
                     )
 
@@ -748,17 +748,19 @@ def test_1d_block_needs_the_whole_contiguous_run(opencl_source):
                         scope="subgroup",
                     )
 
-    with pytest.raises(Exception, match="contiguous elements along the last axis"):
+    with pytest.raises(Exception, match="contiguous elements along the last"):
         opencl_source(Module)
 
 
 @pytest.mark.gpu
 @requires_intel_gpu
-@pytest.mark.parametrize("bits, n", FORMS_1D)
-def test_1d_block_roundtrip(bits, n):
-    """Component c of work-item i is element 16 c + i, and the write puts them back."""
+@pytest.mark.parametrize("bits, n, runs", [(b, n, 1) for b, n in FORMS_1D] + [(16, 4, 3)])
+def test_1d_block_roundtrip(bits, n, runs):
+    """Component c of work-item i is element 16 c + i, and the write puts them back.
+
+    Three runs move with three messages into the view's three repeats."""
     start = 4 * 8 // bits * 3  # 12 bytes in: 4-byte aligned, not 16
-    fun = tvm_tirx.compile(_roundtrip_1d(bits, n, start), target=TARGET)
+    fun = tvm_tirx.compile(_roundtrip_1d(bits, n, start, runs), target=TARGET)
     dtype = _elem(bits)
     src = np.random.default_rng(bits * 100 + n).integers(1, 2 ** min(bits, 16), (2, 512))
     src = src.astype(dtype)
@@ -767,14 +769,14 @@ def test_1d_block_roundtrip(bits, n):
         dev = tvm_tirx.opencl(0)
         args = [
             tvm_tirx.runtime.tensor(src, dev),
-            tvm_tirx.runtime.tensor(np.zeros((n, 16), dtype), dev),
+            tvm_tirx.runtime.tensor(np.zeros((runs * n, 16), dtype), dev),
             tvm_tirx.runtime.tensor(np.zeros((2, 512), dtype), dev),
         ]
         fun["main"](*args)
-        run = src[1, start : start + 16 * n]
-        np.testing.assert_array_equal(args[1].numpy(), run.reshape(n, 16))
+        run = src[1, start : start + 16 * n * runs]
+        np.testing.assert_array_equal(args[1].numpy(), run.reshape(runs * n, 16))
         want = np.zeros((2, 512), dtype)
-        want[1, start : start + 16 * n] = run
+        want[1, start : start + 16 * n * runs] = run
         np.testing.assert_array_equal(args[2].numpy(), want)
 
     tvm_tirx.testing.run_with_gpu_lock(run_and_check)

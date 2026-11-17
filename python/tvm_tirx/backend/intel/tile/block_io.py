@@ -72,10 +72,11 @@ The same instructions take the 1D sub-group block reads and writes,
 ``intel_sub_group_block_{read,write}{,_us,_uc}{,2,4,8}`` (and ``_uc16``).  One
 moves ``16 * n`` contiguous elements of 32, 16 or 8 bits along the last axis of
 a global region, into or out of one ``(n, 16)`` register atom: component ``c``
-of work-item ``i`` is element ``16 * c + i``.  The whole sub-group moves 64 to
-512 contiguous bytes in one message, where a load per work-item moves 2 or 4
-bytes each.  Every form was checked on an Arc Pro B60 and needs a 4-byte-aligned
-start, which lowering proves.
+of work-item ``i`` is element ``16 * c + i``.  A region of ``R`` such runs
+moves with ``R`` messages into the register view's ``(1, R)`` repeats.  The
+sub-group moves 64 to 512 contiguous bytes in one message, where a load per
+work-item moves 2 or 4 bytes each.  Every form was checked on an Arc Pro B60
+and needs a 4-byte-aligned start, which lowering proves.
 
 ``T.intel.tile.block_prefetch(instruction, src, scope="subgroup")`` takes the
 same global operand and pulls its blocks into cache without touching registers,
@@ -349,12 +350,14 @@ def _lower_1d(view, sctx, direction, match):
     dtype = ty.dtype.dtype
     if dtype.bits != bits or dtype.lanes != 1:
         raise ValueError(f"global operand: {name} moves {bits}-bit elements, got {dtype}")
+    run = SUB_GROUP_SIZE * n
     extents = [int(analyzer.simplify(r.extent)) for r in memory.region]
-    if extents[-1] != SUB_GROUP_SIZE * n or any(e != 1 for e in extents[:-1]):
+    if extents[-1] % run or any(e != 1 for e in extents[:-1]):
         raise ValueError(
-            f"global operand: {name} moves {SUB_GROUP_SIZE * n} contiguous elements along "
-            f"the last axis, got a region of {tuple(extents)}"
+            f"global operand: {name} moves runs of {run} contiguous elements along the last "
+            f"axis, got a region of {tuple(extents)}"
         )
+    runs = extents[-1] // run
     layout = ty.effective_layout()
     if layout is None:
         raise ValueError("global operand: requires a physical layout")
@@ -384,11 +387,14 @@ def _lower_1d(view, sctx, direction, match):
     layout_analyzer = Analyzer()
     fragment = Fragment("registers", registers, n, analyzer, layout_analyzer)
     fragment.require_bits(bits, "elements")
-    if fragment.repeats != (1, 1):
+    if fragment.repeats != (1, runs):
         raise ValueError(
-            f"registers: {name} fills one ({n}, 16) atom, got repeats {fragment.repeats}"
+            f"registers: {name} fills one ({n}, 16) atom per run, so expected repeats "
+            f"(1, {runs}), got {fragment.repeats}"
         )
-    base = fragment.base((0, 0))
+    bases = [fragment.base((0, j)) for j in range(runs)]
+    if direction == "read":
+        check_disjoint(analyzer, bases, n, "registers")
     word = f"uint{bits}"
     bindings = []
     # The builtins take a pointer to unsigned words, so address a word view of the tensor.
@@ -399,15 +405,16 @@ def _lower_1d(view, sctx, direction, match):
         f"block_{direction}_words", T.Tensor((numel,), word, scope="global", layout="default")
     )
     bindings.append(Bind(words, T.decl_tensor(tensor.data, ty_args=[words.ty])))
-    pointer = words.ptr_to([start])
-    if direction == "read":
-        value = T.call_extern(name, pointer, ty=vector_type(word, n))
-        body = fragment.store(bindings, base, value, dtype=word)
-    else:
-        body = Evaluate(
-            T.call_extern(name, pointer, fragment.load(bindings, base, word), ty="void")
-        )
-    return SeqStmt([*bindings, body])
+    body = []
+    for j, base in enumerate(bases):
+        pointer = words.ptr_to([analyzer.simplify(start + j * run)])
+        if direction == "read":
+            value = T.call_extern(name, pointer, ty=vector_type(word, n))
+            body.append(fragment.store(bindings, base, value, dtype=word))
+        else:
+            value = fragment.load(bindings, base, word)
+            body.append(Evaluate(T.call_extern(name, pointer, value, ty="void")))
+    return SeqStmt([*bindings, *body])
 
 
 def _lower(view, sctx, direction):
