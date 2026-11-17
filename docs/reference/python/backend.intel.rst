@@ -39,6 +39,7 @@ Namespaces
 * :doc:`tvm_tirx.backend.intel.tile.block_io <backend.intel.tile.block_io>`
 * :doc:`tvm_tirx.backend.intel.tile.dpas <backend.intel.tile.dpas>`
 * :doc:`tvm_tirx.backend.intel.tile.ewise <backend.intel.tile.ewise>`
+* :doc:`tvm_tirx.backend.intel.tile.reduce <backend.intel.tile.reduce>`
 
 .. toctree::
    :hidden:
@@ -50,3 +51,4 @@ Namespaces
    backend.intel.tile.block_io
    backend.intel.tile.dpas
    backend.intel.tile.ewise
+   backend.intel.tile.reduce

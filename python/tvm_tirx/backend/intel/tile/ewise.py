@@ -59,14 +59,13 @@ from tvm_tirx.ir import (
     Tuple,
     Var,
 )
-from tvm_tirx.runtime import MemoryScope
 from tvm_tirx.script import tirx as T
 from tvm_tirx.sym import Analyzer
 from tvm_tirx.tirx import Function
 from tvm_tirx.tirx.tile.instruction import Instruction, Operand
 
 from ._publish import publish
-from .fragment import SUB_GROUP_SIZE, require_intel_target
+from .fragment import SUB_GROUP_SIZE, RegisterView, require_intel_target
 
 
 def _scalar_body(statements, env):
@@ -107,49 +106,6 @@ def _as_lambda(function):
     return LambdaExpr([p.ty for p in function.params], expression, ret_type=function.ret_type)
 
 
-class _Registers:
-    """A register operand's placement of each logical coordinate: (work-item, offset)."""
-
-    def __init__(self, name, region, analyzer):
-        if not isinstance(region, TensorRegion):
-            raise TypeError(f"{name}: expected a register tensor region")
-        self.name, self.region = name, region
-        self.tensor, self.ty = region.source, region.source.ty
-        self.dtype = str(self.ty.dtype.dtype)
-        if self.ty.scope != MemoryScope("local"):
-            raise ValueError(f"{name}: ewise operands must be in registers, got {self.ty.scope}")
-        self.layout = self.ty.effective_layout()
-        if self.layout is None:
-            raise ValueError(f"{name}: operand requires a physical layout")
-        self.analyzer = analyzer
-        self.begin = []
-        for r in region.region:
-            begin = analyzer.simplify(r.begin)
-            if not isinstance(begin, IntImm):
-                raise ValueError(f"{name}: ewise needs a static region, got start {begin}")
-            self.begin.append(int(begin))
-        self.shape = tuple(int(analyzer.simplify(r.extent)) for r in region.region)
-        self.raw = None
-
-    def place(self, coord):
-        indices = [IntImm("int32", b + c) for b, c in zip(self.begin, coord)]
-        physical = dict(self.layout.apply(*indices, shape=self.ty.shape))
-        for axis in set(physical) - {"m", "sglid"}:
-            if int(self.analyzer.simplify(physical[axis])) != 0:
-                raise ValueError(f"{self.name}: layout places values on axis {axis!r}")
-        lane = int(self.analyzer.simplify(physical.get("sglid", IntImm("int32", 0))))
-        return lane, int(self.analyzer.simplify(physical["m"]))
-
-    def storage(self, bindings):
-        if self.raw is None:
-            span = self.layout.span("m")
-            self.raw = Var(
-                f"ewise_{self.name}", T.Tensor((span,), self.dtype, scope="local", layout="default")
-            )
-            bindings.append(Bind(self.raw, T.decl_tensor(self.tensor.data, ty_args=[self.raw.ty])))
-        return self.raw
-
-
 def _lower(view, sctx):
     function, dst, packed = view.args
     inputs = list(packed.fields) if packed is not None else []
@@ -158,16 +114,16 @@ def _lower(view, sctx):
     if sctx.scope_kind == "subgroup":
         require_intel_target(sctx.target, "ewise")
     analyzer = Analyzer()
-    out = _Registers("dst", dst, analyzer)
+    out = RegisterView("dst", dst, analyzer)
     sources = [
-        _Registers(f"src{i}", value, analyzer) if isinstance(value, TensorRegion) else value
+        RegisterView(f"src{i}", value, analyzer) if isinstance(value, TensorRegion) else value
         for i, value in enumerate(inputs)
     ]
     for i, (param, value) in enumerate(zip(function.vars, sources)):
-        dtype = value.dtype if isinstance(value, _Registers) else str(value.ty.dtype)
+        dtype = value.dtype if isinstance(value, RegisterView) else str(value.ty.dtype)
         if dtype != str(param.ty.dtype):
             raise TypeError(f"ewise input {i}: dtype must match the scalar function parameter")
-        if isinstance(value, _Registers) and value.shape != out.shape:
+        if isinstance(value, RegisterView) and value.shape != out.shape:
             raise ValueError(
                 f"src{i}: expected the destination's shape {out.shape}, got {value.shape}"
             )
@@ -184,13 +140,15 @@ def _lower(view, sctx):
             raise ValueError(f"dst: coordinates {slot['lanes'][lane]} and {coord} share a register")
         slot["lanes"][lane] = coord
         for i, source in enumerate(sources):
-            if not isinstance(source, _Registers):
+            if not isinstance(source, RegisterView):
                 continue
             src_lane, src_offset = source.place(coord)
-            if src_lane != lane:
+            # An input every work-item holds is available wherever dst needs it.
+            if src_lane is not None and src_lane != lane:
+                held = "every work-item" if lane is None else f"work-item {lane}"
                 raise ValueError(
                     f"src{i}: coordinate {coord} is on work-item {src_lane}, but dst holds it on "
-                    f"work-item {lane}; ewise does not move data between work-items"
+                    f"{held}; ewise does not move data between work-items"
                 )
             if slot["inputs"][i] not in (None, src_offset):
                 raise ValueError(
@@ -203,14 +161,14 @@ def _lower(view, sctx):
         raise ValueError(f"dst: the tile spans {lanes} work-items, not a whole sub-group")
 
     bindings, body = [], []
-    out_raw = out.storage(bindings)
+    out_raw = out.storage(bindings, "ewise")
     for offset in sorted(reads):
         slot = reads[offset]
         if len(slot["lanes"]) != lanes:
             raise ValueError(f"dst: register {offset} is held by only some of the work-items")
         values = [
-            source.storage(bindings)[slot["inputs"][i]]
-            if isinstance(source, _Registers)
+            source.storage(bindings, "ewise")[slot["inputs"][i]]
+            if isinstance(source, RegisterView)
             else source
             for i, source in enumerate(sources)
         ]

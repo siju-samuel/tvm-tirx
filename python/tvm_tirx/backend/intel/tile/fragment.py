@@ -26,7 +26,8 @@ that way, which was established for each builtin on an Arc Pro B60.
 
 import tvm_ffi
 
-from tvm_tirx.ir import Bind, Range, TensorRegion, TensorStore, Var
+from tvm_tirx.backend.opencl.axis import sglid
+from tvm_tirx.ir import Bind, IntImm, Range, TensorRegion, TensorStore, Var
 from tvm_tirx.ir.prim import Or, Ramp
 from tvm_tirx.runtime import MemoryScope
 from tvm_tirx.script import tirx as T
@@ -115,6 +116,12 @@ class Fragment:
         self.layout = self.ty.effective_layout()
         if self.layout is None:
             raise ValueError(f"{name}: operand requires a physical layout")
+        replicas = [it for it in getattr(self.layout, "replica", ()) if str(it.axis) == str(sglid)]
+        if replicas and [int(it.extent) for it in replicas] != [SUB_GROUP_SIZE]:
+            raise ValueError(
+                f"{name}: a replica must cover the whole sub-group, R[{SUB_GROUP_SIZE} : 1 @ sglid]"
+            )
+        self.replicated = bool(replicas)
         self.shape = tuple(int(analyzer.simplify(r.extent)) for r in region.region)
         n = len(atom.shape)
         if len(self.shape) < n + 2 or self.shape[-n:] != atom.shape:
@@ -247,3 +254,62 @@ def check_disjoint(analyzer, bases, width, name):
             apart = Or(first - second >= width, second - first >= width)
             if not analyzer.can_prove(apart):
                 raise ValueError(f"{name}: two repeats share registers")
+
+
+class RegisterView:
+    """Where a register operand holds each logical coordinate: ``(work-item, offset)``.
+
+    The work-item is None when the layout replicates the tile over the whole
+    sub-group, ``R[16 : 1 @ sglid]``: every work-item then holds every element
+    in its own registers, which is how a reduction across the sub-group leaves
+    its result.
+    """
+
+    def __init__(self, name, region, analyzer):
+        if not isinstance(region, TensorRegion):
+            raise TypeError(f"{name}: expected a register tensor region")
+        self.name, self.region = name, region
+        self.tensor, self.ty = region.source, region.source.ty
+        self.dtype = str(self.ty.dtype.dtype)
+        if self.ty.scope != MemoryScope("local"):
+            raise ValueError(f"{name}: operands must be in registers, got {self.ty.scope}")
+        self.layout = self.ty.effective_layout()
+        if self.layout is None:
+            raise ValueError(f"{name}: operand requires a physical layout")
+        replicas = [it for it in getattr(self.layout, "replica", ()) if str(it.axis) == str(sglid)]
+        if replicas and [int(it.extent) for it in replicas] != [SUB_GROUP_SIZE]:
+            raise ValueError(
+                f"{name}: a replica must cover the whole sub-group, R[{SUB_GROUP_SIZE} : 1 @ sglid]"
+            )
+        self.replicated = bool(replicas)
+        self.analyzer = analyzer
+        self.begin = []
+        for r in region.region:
+            begin = analyzer.simplify(r.begin)
+            if not isinstance(begin, IntImm):
+                raise ValueError(f"{name}: needs a static region, got start {begin}")
+            self.begin.append(int(begin))
+        self.shape = tuple(int(analyzer.simplify(r.extent)) for r in region.region)
+        self.raw = None
+
+    def place(self, coord):
+        indices = [IntImm("int32", b + c) for b, c in zip(self.begin, coord)]
+        physical = dict(self.layout.apply(*indices, shape=self.ty.shape))
+        for axis in set(physical) - {"m", "sglid"}:
+            if int(self.analyzer.simplify(physical[axis])) != 0:
+                raise ValueError(f"{self.name}: layout places values on axis {axis!r}")
+        if self.replicated:
+            lane = None
+        else:
+            lane = int(self.analyzer.simplify(physical.get("sglid", IntImm("int32", 0))))
+        return lane, int(self.analyzer.simplify(physical["m"]))
+
+    def storage(self, bindings, prefix):
+        if self.raw is None:
+            span = self.layout.span("m")
+            self.raw = Var(
+                f"{prefix}_{self.name}",
+                T.Tensor((span,), self.dtype, scope="local", layout="default"),
+            )
+            bindings.append(Bind(self.raw, T.decl_tensor(self.tensor.data, ty_args=[self.raw.ty])))
+        return self.raw

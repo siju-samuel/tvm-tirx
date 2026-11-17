@@ -344,6 +344,38 @@ another work-item. Because nothing is exchanged, the call is safe under control
 flow that differs within a sub-group, but only at ``scope="thread"``: at
 ``"subgroup"`` it is held to the collectives' convergence proof.
 
+Reductions
+----------
+
+``T.intel.tile.reduce(op, dst, src, scope="subgroup")`` combines ``src`` over
+every axis on which ``dst`` has extent 1, with ``op`` one of ``"sum"``,
+``"max"`` and ``"min"``. Over the columns of an accumulator, which the sub-group
+holds one per work-item, that is the row maximum and row sum of a softmax:
+
+.. code-block:: python
+
+    acc = fragment(1, 2, 8)  # 8 x 32: rows in registers, columns across the sub-group
+    # One value per row on every work-item, and the same rows presented as the whole tile.
+    rows = TileLayout(S[(1, 1, 8, 1) : (8, 8, 1, 1)] + R[16 : 1 @ sglid])
+    rows_as_tile = TileLayout(S[(1, 2, 8, 16) : (0, 0, 1, 0)] + R[16 : 1 @ sglid])
+
+    T.intel.tile.reduce("max", m.view(1, 1, 8, 1, layout=rows), s.view(1, 2, 8, 16, layout=acc))
+    T.intel.tile.ewise(
+        exp_minus,  # exp(x - m)
+        s.view(1, 2, 8, 16, layout=acc),
+        s.view(1, 2, 8, 16, layout=acc),
+        m.view(1, 2, 8, 16, layout=rows_as_tile),
+    )
+    T.intel.tile.reduce("sum", l.view(1, 1, 8, 1, layout=rows), s.view(1, 2, 8, 16, layout=acc))
+
+Each work-item first combines the two column blocks it holds, then
+``sub_group_reduce_max`` combines across the sub-group. That leaves each result
+on every work-item, which the layout of ``m`` says with a replica over the
+sub-group, ``R[16 : 1 @ sglid]``. A replicated operand is an input ``ewise``
+can read on any work-item, so ``m`` broadcasts along the columns through a view
+with stride 0. A reduction whose elements stay on one work-item each, such as
+summing two column blocks, moves no data and keeps the columns where they were.
+
 Larger Tiles
 ------------
 

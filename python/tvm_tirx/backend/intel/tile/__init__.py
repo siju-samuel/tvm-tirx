@@ -22,6 +22,6 @@ its sub-group scopes; the namespace says whose instructions they are, as
 Intel part before lowering.
 """
 
-from . import block_io, dpas, ewise
+from . import block_io, dpas, ewise, reduce
 
-__all__ = ["block_io", "dpas", "ewise"]
+__all__ = ["block_io", "dpas", "ewise", "reduce"]
