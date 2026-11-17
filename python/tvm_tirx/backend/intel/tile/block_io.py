@@ -68,6 +68,15 @@ when violated, so lowering requires a proof of both: the row pitch must be a
 multiple of 16 bytes, and every block's x offset must be 4-byte aligned.  The
 tensor must be at least 4-byte aligned, which was the coarsest alignment tested.
 
+The same instructions take the 1D sub-group block reads and writes,
+``intel_sub_group_block_{read,write}{,_us,_uc}{,2,4,8}`` (and ``_uc16``).  One
+moves ``16 * n`` contiguous elements of 32, 16 or 8 bits along the last axis of
+a global region, into or out of one ``(n, 16)`` register atom: component ``c``
+of work-item ``i`` is element ``16 * c + i``.  The whole sub-group moves 64 to
+512 contiguous bytes in one message, where a load per work-item moves 2 or 4
+bytes each.  Every form was checked on an Arc Pro B60 and needs a 4-byte-aligned
+start, which lowering proves.
+
 ``T.intel.tile.block_prefetch(instruction, src, scope="subgroup")`` takes the
 same global operand and pulls its blocks into cache without touching registers,
 so a later read of them hits.  ``prefetch_16b_{1,...,32}r16x{1,2}c`` and
@@ -83,7 +92,7 @@ call, which TileDispatch proves before lowering it.
 import re
 from dataclasses import dataclass
 
-from tvm_tirx.ir import Evaluate, IntImm, SeqStmt, TensorRegion
+from tvm_tirx.ir import Bind, Evaluate, IntImm, SeqStmt, TensorRegion, Var
 from tvm_tirx.ir.prim import Cast, Shuffle
 from tvm_tirx.runtime import MemoryScope
 from tvm_tirx.script import tirx as T
@@ -98,6 +107,7 @@ from .fragment import (
     context_analyzer,
     require_converged,
     require_intel_target,
+    vector_type,
 )
 
 _NAME = re.compile(
@@ -122,6 +132,13 @@ VERIFIED = {
     ("prefetch", 16): (_ROWS, 16, (1, 2)),
     ("prefetch", 8): (_ROWS, 32, (1, 2)),
 }
+# 1D sub-group block reads and writes (cl_intel_subgroups and its short and char forms):
+# element bits -> the component counts checked on an Arc Pro B60.  Each moves 16 * n
+# contiguous elements; component c of work-item i is element 16 * c + i.  Every form read and
+# wrote correctly at any 4-byte-aligned address and wrongly at a 1- or 2-byte offset.
+_ONE_D = re.compile(r"^intel_sub_group_block_(read|write)(?:_(uc|us))?(\d*)$")
+VERIFIED_1D = {8: (1, 2, 4, 8, 16), 16: (1, 2, 4, 8), 32: (1, 2, 4, 8)}
+ALIGNMENT_1D = 4  # bytes
 PITCH_ALIGNMENT = 16  # bytes; anything coarser than 4 bytes but not 16 reads wrong data
 X_ALIGNMENT = 4  # bytes
 BASE_ALIGNMENT = 4  # bytes; the coarsest alignment measured to work
@@ -305,8 +322,100 @@ def _lower_prefetch(view, sctx):
     return SeqStmt(body)
 
 
+def _lower_1d(view, sctx, direction, match):
+    """Move 16 * n contiguous elements with a 1D sub-group block read or write."""
+    _, dst, src = view.args
+    name = match.group(0)
+    kind, suffix, count = match.groups()
+    if kind != direction:
+        raise ValueError(f"{name} belongs to block_{kind}")
+    bits = {"uc": 8, "us": 16, None: 32}[suffix]
+    n = int(count) if count else 1
+    if n not in VERIFIED_1D[bits]:
+        raise ValueError(
+            f"{name}: {bits}-bit 1D block {kind}s were checked with {VERIFIED_1D[bits]} "
+            "components; no others are accepted"
+        )
+    require_intel_target(sctx.target, f"block_{direction}")
+    require_converged(sctx, f"block_{direction}")
+    registers, memory = (dst, src) if direction == "read" else (src, dst)
+    analyzer, _, resolve = context_analyzer(sctx)
+
+    if not isinstance(memory, TensorRegion):
+        raise TypeError("global operand: expected a tensor region")
+    tensor, ty = memory.source, memory.source.ty
+    if ty.scope != MemoryScope("global"):
+        raise ValueError(f"global operand: expected global memory, got {ty.scope}")
+    dtype = ty.dtype.dtype
+    if dtype.bits != bits or dtype.lanes != 1:
+        raise ValueError(f"global operand: {name} moves {bits}-bit elements, got {dtype}")
+    extents = [int(analyzer.simplify(r.extent)) for r in memory.region]
+    if extents[-1] != SUB_GROUP_SIZE * n or any(e != 1 for e in extents[:-1]):
+        raise ValueError(
+            f"global operand: {name} moves {SUB_GROUP_SIZE * n} contiguous elements along "
+            f"the last axis, got a region of {tuple(extents)}"
+        )
+    layout = ty.effective_layout()
+    if layout is None:
+        raise ValueError("global operand: requires a physical layout")
+    begin = [analyzer.simplify(r.begin) for r in memory.region]
+
+    def offset(step):
+        coords = [*begin[:-1], analyzer.simplify(begin[-1] + step)]
+        physical = dict(layout.apply(*coords, shape=ty.shape))
+        if set(physical) - {"m"}:
+            raise ValueError("global operand: layout must address memory only")
+        return analyzer.simplify(physical["m"])
+
+    start = offset(0)
+
+    def require(condition, message):
+        if not analyzer.can_prove(resolve(condition)):
+            raise ValueError(f"global operand: {message}: cannot prove {condition}")
+
+    require(offset(1) - start == 1, "the last axis must be contiguous")
+    if int(ty.data_alignment) < ALIGNMENT_1D:
+        raise ValueError(
+            f"global operand: tensor must be at least {ALIGNMENT_1D}-byte aligned, "
+            f"got {ty.data_alignment}"
+        )
+    require(start * (bits // 8) % ALIGNMENT_1D == 0, f"start must be {ALIGNMENT_1D}-byte aligned")
+
+    layout_analyzer = Analyzer()
+    fragment = Fragment("registers", registers, n, analyzer, layout_analyzer)
+    fragment.require_bits(bits, "elements")
+    if fragment.repeats != (1, 1):
+        raise ValueError(
+            f"registers: {name} fills one ({n}, 16) atom, got repeats {fragment.repeats}"
+        )
+    base = fragment.base((0, 0))
+    word = f"uint{bits}"
+    bindings = []
+    # The builtins take a pointer to unsigned words, so address a word view of the tensor.
+    numel = 1
+    for extent in ty.shape:
+        numel = numel * extent
+    words = Var(
+        f"block_{direction}_words", T.Tensor((numel,), word, scope="global", layout="default")
+    )
+    bindings.append(Bind(words, T.decl_tensor(tensor.data, ty_args=[words.ty])))
+    pointer = words.ptr_to([start])
+    if direction == "read":
+        value = T.call_extern(name, pointer, ty=vector_type(word, n))
+        body = fragment.store(bindings, base, value, dtype=word)
+    else:
+        body = Evaluate(
+            T.call_extern(name, pointer, fragment.load(bindings, base, word), ty="void")
+        )
+    return SeqStmt([*bindings, body])
+
+
 def _lower(view, sctx, direction):
     instruction, dst, src = view.args
+    name = instruction.value if hasattr(instruction, "value") else str(instruction)
+    match = _ONE_D.match(name)
+    if match:
+        return _lower_1d(view, sctx, direction, match)
     var = _checked_variant(instruction, direction)
     name = var.name
     require_intel_target(sctx.target, f"block_{direction}")

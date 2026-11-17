@@ -664,5 +664,121 @@ def test_batched_surface_needs_an_aligned_matrix_start(opencl_source):
         opencl_source(main)
 
 
+# The 1D sub-group block forms: element bits -> component counts.
+FORMS_1D = [
+    (bits, n)
+    for bits, counts in ((8, (1, 2, 4, 8, 16)), (16, (1, 2, 4, 8)), (32, (1, 2, 4, 8)))
+    for n in counts
+]
+
+
+def _name_1d(kind, bits, n):
+    return (
+        f"intel_sub_group_block_{kind}{ {8: '_uc', 16: '_us', 32: ''}[bits] }{n if n > 1 else ''}"
+    )
+
+
+def _roundtrip_1d(bits, n, start):
+    """Read 16 * n elements of row 1 into registers, record the registers, write them back."""
+    dtype, count = _elem(bits), 16 * n
+    atom = frag(1, 1, n)
+
+    @I.ir_module
+    class Module:
+        @T.function
+        def main(
+            Src: T.Tensor((2, 512), dtype),
+            Regs: T.Tensor((n, 16), dtype),
+            Dst: T.Tensor((2, 512), dtype),
+        ):
+            T.func_attr({"tirx.noalias": True})
+            with T.launch_thread("blockIdx.x", 1):
+                with T.launch_thread("threadIdx.x", 16) as lane:
+                    r = T.alloc_local((n,), dtype)
+                    T.intel.tile.block_read(
+                        _name_1d("read", bits, n),
+                        r.view(1, 1, n, 16, layout=atom),
+                        Src[1, start : start + count],
+                        scope="subgroup",
+                    )
+                    for c in range(n):
+                        Regs[c, lane] = r[c]
+                    T.intel.tile.block_write(
+                        _name_1d("write", bits, n),
+                        Dst[1, start : start + count],
+                        r.view(1, 1, n, 16, layout=atom),
+                        scope="subgroup",
+                    )
+
+    return Module
+
+
+def test_1d_block_read_lowers_to_the_builtin(opencl_source):
+    source = opencl_source(_roundtrip_1d(16, 8, 32))
+    assert "intel_sub_group_block_read_us8(" in source
+    assert "intel_sub_group_block_write_us8(" in source
+
+
+@pytest.mark.parametrize(
+    "bits, n, start, match",
+    [
+        (16, 8, 1, "4-byte aligned"),  # a 2-byte offset reads wrong data
+        (8, 4, 2, "4-byte aligned"),
+        (16, 16, 0, "were checked with"),  # no 16-component short form
+    ],
+)
+def test_1d_block_rejects(opencl_source, bits, n, start, match):
+    with pytest.raises(Exception, match=match):
+        opencl_source(_roundtrip_1d(bits, n, start))
+
+
+def test_1d_block_needs_the_whole_contiguous_run(opencl_source):
+    @I.ir_module
+    class Module:
+        @T.function
+        def main(Src: T.Tensor((2, 512), "uint16"), Dst: T.Tensor((2, 512), "uint16")):
+            T.func_attr({"tirx.noalias": True})
+            with T.launch_thread("blockIdx.x", 1):
+                with T.launch_thread("threadIdx.x", 16):
+                    r = T.alloc_local((8,), "uint16")
+                    T.intel.tile.block_read(
+                        "intel_sub_group_block_read_us8",
+                        r.view(1, 1, 8, 16, layout=frag(1, 1, 8)),
+                        Src[0:2, 0:64],
+                        scope="subgroup",
+                    )
+
+    with pytest.raises(Exception, match="contiguous elements along the last axis"):
+        opencl_source(Module)
+
+
+@pytest.mark.gpu
+@requires_intel_gpu
+@pytest.mark.parametrize("bits, n", FORMS_1D)
+def test_1d_block_roundtrip(bits, n):
+    """Component c of work-item i is element 16 c + i, and the write puts them back."""
+    start = 4 * 8 // bits * 3  # 12 bytes in: 4-byte aligned, not 16
+    fun = tvm_tirx.compile(_roundtrip_1d(bits, n, start), target=TARGET)
+    dtype = _elem(bits)
+    src = np.random.default_rng(bits * 100 + n).integers(1, 2 ** min(bits, 16), (2, 512))
+    src = src.astype(dtype)
+
+    def run_and_check():
+        dev = tvm_tirx.opencl(0)
+        args = [
+            tvm_tirx.runtime.tensor(src, dev),
+            tvm_tirx.runtime.tensor(np.zeros((n, 16), dtype), dev),
+            tvm_tirx.runtime.tensor(np.zeros((2, 512), dtype), dev),
+        ]
+        fun["main"](*args)
+        run = src[1, start : start + 16 * n]
+        np.testing.assert_array_equal(args[1].numpy(), run.reshape(n, 16))
+        want = np.zeros((2, 512), dtype)
+        want[1, start : start + 16 * n] = run
+        np.testing.assert_array_equal(args[2].numpy(), want)
+
+    tvm_tirx.testing.run_with_gpu_lock(run_and_check)
+
+
 if __name__ == "__main__":
     tvm_tirx.testing.main()
