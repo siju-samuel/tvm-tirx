@@ -225,5 +225,83 @@ def test_gemm_epilogue():
     tvm_tirx.testing.run_with_gpu_lock(run_and_check)
 
 
+@T.function(private=True)
+def to_half(x: T.float32) -> T.float16:
+    return T.Cast("float16", x)
+
+
+@pytest.mark.gpu
+@requires_intel_gpu
+def test_accumulator_converts_to_an_a_operand():
+    """(A @ B) @ V with the product converted to float16 in registers, as attention's P @ V.
+
+    A DPAS accumulator and a float16 A operand place element (row, k) the same
+    way, row in a register and k on work-item k, so an ewise with a cast turns
+    one into the other without moving data."""
+    M, K1, N1, N2 = 8, 16, 16, 16
+    frag = lay((1, 1, 8, 16), (8, 8, 1))
+
+    @I.ir_module
+    class Module:
+        @T.function
+        def main(
+            A: T.Tensor((M, K1), "float16"),
+            B: T.Tensor((K1, N1), "float16"),
+            V: T.Tensor((N1, N2), "float16"),
+            O: T.Tensor((M, N2), "float32"),
+        ):
+            T.func_attr({"tirx.noalias": True})
+            with T.launch_thread("blockIdx.x", 1):
+                with T.launch_thread("threadIdx.x", 16) as lane:
+                    ar = T.alloc_local((8,), "float16")
+                    br = T.alloc_local((16,), "float16")
+                    vr = T.alloc_local((16,), "float16")
+                    sr = T.alloc_local((8,), "float32")
+                    pr = T.alloc_local((8,), "float16")
+                    orr = T.alloc_local((8,), "float32")
+                    for r in range(8):
+                        ar[r] = A[r, lane]
+                        sr[r] = T.float32(0)
+                        orr[r] = T.float32(0)
+                    for k in range(16):
+                        br[k] = B[k, lane]
+                        vr[k] = V[k, lane]
+                    T.intel.tile.dpas(
+                        F16,
+                        sr.view(1, 1, 8, 16, layout=frag),
+                        ar.view(1, 1, 8, 16, layout=frag),
+                        br.view(T.uint32.dtype).view(1, 1, 8, 16, layout=frag),
+                        sr.view(1, 1, 8, 16, layout=frag),
+                        scope="subgroup",
+                    )
+                    T.intel.tile.ewise(
+                        to_half, pr.view(1, 1, 8, 16, layout=frag), sr.view(1, 1, 8, 16, layout=frag)
+                    )
+                    T.intel.tile.dpas(
+                        F16,
+                        orr.view(1, 1, 8, 16, layout=frag),
+                        pr.view(1, 1, 8, 16, layout=frag),
+                        vr.view(T.uint32.dtype).view(1, 1, 8, 16, layout=frag),
+                        orr.view(1, 1, 8, 16, layout=frag),
+                        scope="subgroup",
+                    )
+                    for r in range(8):
+                        O[r, lane] = orr[r]
+
+    fun = tvm_tirx.compile(Module, target=TARGET)
+    rng = np.random.default_rng(0)
+    a, b, v = (rng.standard_normal(s).astype(np.float16) for s in ((M, K1), (K1, N1), (N1, N2)))
+
+    def run_and_check():
+        dev = tvm_tirx.opencl(0)
+        args = [tvm_tirx.runtime.tensor(x, dev) for x in (a, b, v, np.zeros((M, N2), np.float32))]
+        fun["main"](*args)
+        p = (a.astype(np.float32) @ b.astype(np.float32)).astype(np.float16)
+        want = p.astype(np.float32) @ v.astype(np.float32)
+        np.testing.assert_allclose(args[3].numpy(), want, rtol=1e-3, atol=1e-3)
+
+    tvm_tirx.testing.run_with_gpu_lock(run_and_check)
+
+
 if __name__ == "__main__":
     tvm_tirx.testing.main()
