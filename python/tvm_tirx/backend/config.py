@@ -29,10 +29,12 @@ def copy_backend_config(config=None):
         raise TypeError("backend_config must be a mapping of backend names to configurations")
     result = {}
     for name, value in config.items():
-        if name != "cuda":
+        if name == "cuda":
+            from .cuda.backend_config import validate_backend_config
+        elif name == "opencl":
+            from .opencl.backend_config import validate_backend_config
+        else:
             raise ValueError(f"backend_config does not yet support backend {name!r}")
-        from .cuda.backend_config import validate_backend_config
-
         result[name] = validate_backend_config(value)
     return result
 

@@ -910,8 +910,15 @@ ffi::Module BuildOpenCL(IRModule mod, Target target) {
   // opencl default of 1 means the width is unknown.  See LowerThreadAllreduce.
   int64_t warp_size = target->GetAttr<int64_t>("thread_warp_size", 1).value();
   // Compiler options are recorded in each kernel's source, which the runtime reads when it builds
-  // that kernel; see KernelBuildOptions.  A newline would end the directive early, so reject it.
+  // that kernel; see KernelBuildOptions.  They are the target's, unless the kernels' backend_config
+  // replaces them; compilation groups kernels by backend_config, so one module shares one.  A
+  // newline would end the directive early, so reject it.
   std::string build_options = target->GetAttr<ffi::String>("build_options").value_or("");
+  if (auto config = mod->GetAttr<ffi::String>("backend_config")) {
+    if (auto resolve = ffi::Function::GetGlobal("opencl.resolve_build_options")) {
+      build_options = (*resolve)(config.value(), target).cast<std::string>();
+    }
+  }
   TVM_FFI_CHECK(build_options.find('\n') == std::string::npos, ValueError)
       << "OpenCL build_options must be a single line";
 

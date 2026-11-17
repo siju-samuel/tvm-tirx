@@ -36,12 +36,18 @@ from tvm_tirx.testing import env
 PROBE = "-Dtirx_build_option_probe()=42"
 
 
-def _module():
+def _module(backend_config=None):
+    from tvm_tirx.backend.config import backend_config_json
+
+    attrs = {"tirx.noalias": True}
+    if backend_config is not None:
+        attrs["backend_config"] = backend_config_json(backend_config)
+
     @I.ir_module
     class Module:
         @T.function
         def main(A: T.Tensor((1,), "int32")):
-            T.func_attr({"tirx.noalias": True})
+            T.func_attr(attrs)
             with T.launch_thread("blockIdx.x", 1):
                 with T.launch_thread("threadIdx.x", 1):
                     A[0] = T.call_pure_extern("tirx_build_option_probe", ty="int32")
@@ -72,6 +78,52 @@ def test_multiline_options_are_rejected(monkeypatch):
     monkeypatch.setenv("TVM_TIRX_COMPILE_FORCE_FALLBACK", "1")
     with pytest.raises(Exception, match="single line"):
         tvm_tirx.compile(_module(), target=_target("-DA=1\n-DB=2"))
+
+
+def test_backend_config_replaces_the_target_options(monkeypatch):
+    """A kernel's own options win over the target's, which still apply to the rest."""
+    monkeypatch.setenv("TVM_TIRX_COMPILE_FORCE_FALLBACK", "1")
+    config = {"opencl": {"build_options": PROBE}}
+    source = (
+        tvm_tirx.compile(_module(config), target=_target("-DOTHER=1"))
+        .mod.imports[0]
+        .inspect_source("cl")
+    )
+    assert source.splitlines()[1] == f"// Build options: {PROBE}"
+    source = (
+        tvm_tirx.compile(_module(), target=_target("-DOTHER=1")).mod.imports[0].inspect_source("cl")
+    )
+    assert source.splitlines()[1] == "// Build options: -DOTHER=1"
+
+
+@pytest.mark.parametrize(
+    "entry, error, match",
+    [
+        ({"grf": "256"}, ValueError, "Unknown OpenCL backend_config key"),
+        ({"build_options": ["-DA=1"]}, TypeError, "must be a string"),
+        ({"build_options": "-DA=1\n-DB=2"}, ValueError, "single line"),
+    ],
+)
+def test_backend_config_entry_is_checked(entry, error, match):
+    from tvm_tirx.backend.config import backend_config_json
+
+    with pytest.raises(error, match=match):
+        backend_config_json({"opencl": entry})
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not env.has_opencl(), reason="need opencl")
+def test_runtime_builds_with_the_kernel_options():
+    fun = tvm_tirx.compile(
+        _module({"opencl": {"build_options": PROBE}}), target=_target("-DOTHER=1")
+    )
+
+    def run_and_check():
+        a = tvm_tirx.runtime.tensor(np.zeros(1, np.int32), tvm_tirx.opencl(0))
+        fun["main"](a)
+        assert a.numpy()[0] == 42
+
+    tvm_tirx.testing.run_with_gpu_lock(run_and_check)
 
 
 @pytest.mark.gpu
