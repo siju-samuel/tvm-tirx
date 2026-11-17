@@ -33,6 +33,7 @@ Classes
    Device
    MemoryScope
    Tensor
+   Timer
 
 Functions
 ---------
@@ -54,3 +55,4 @@ Functions
    hexagon
    enabled
    num_threads
+   device_timer

@@ -49,3 +49,4 @@ Namespaces
 
    testing.env
    testing.bench
+   testing.device_bench

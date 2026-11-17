@@ -24,6 +24,7 @@ from tvm_ffi._dtype import DataTypeCode
 from .device import Device
 from .memory_scope import MemoryScope
 from ._tensor import Tensor, tensor, empty
+from .timer import Timer, device_timer
 
 # function exposures
 from ._tensor import cpu, cuda, opencl, vulkan, metal
