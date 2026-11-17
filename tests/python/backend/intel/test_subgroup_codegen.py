@@ -92,6 +92,16 @@ def test_intel_kernel_enables_sub_group_extension():
     assert "cl_intel_subgroups" in source
 
 
+def test_khronos_sub_group_pragma_is_only_a_fallback():
+    """Intel's compiler rejects the cl_khr_subgroups pragma with a warning, which ocloc
+    prints for every kernel it builds; it is enabled only without cl_intel_subgroups."""
+    source = _opencl_source("intel/arc-b60-opencl")
+    intel = source.index("#if defined(cl_intel_subgroups)")
+    khronos = source.index("#elif defined(cl_khr_subgroups)")
+    assert intel < khronos
+    assert source.count("#pragma OPENCL EXTENSION cl_khr_subgroups") == 1
+
+
 def test_intel_shuffle_reduction_needs_no_barrier():
     """A reduction inside one sub-group is pure data dependencies."""
     source = _opencl_source("intel/arc-b60-opencl")

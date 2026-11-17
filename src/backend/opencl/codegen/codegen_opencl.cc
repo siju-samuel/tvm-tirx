@@ -195,15 +195,16 @@ std::string CodeGenOpenCL::Finish() {
                    "#endif\n\n";
   }
 
-  // Sub-group shuffles come from cl_intel_subgroups; sub_group_barrier is core in OpenCL 2.0 and
-  // comes from cl_khr_subgroups before that.  Enable both when present rather than requiring a
-  // particular OpenCL version.
+  // Sub-group functions come from cl_intel_subgroups, which also has the shuffles, or from
+  // cl_khr_subgroups.  Enable the one present rather than requiring a particular OpenCL version.
+  // Intel's compiler defines both but rejects the cl_khr_subgroups pragma ("unsupported OpenCL
+  // extension"), and ocloc prints that warning for every kernel built ahead of time, so the
+  // Khronos pragma is only for a device without the Intel extension.
   if (enable_subgroups_) {
-    decl_stream << "#ifdef cl_khr_subgroups\n"
-                   "#pragma OPENCL EXTENSION cl_khr_subgroups : enable\n"
-                   "#endif\n"
-                   "#ifdef cl_intel_subgroups\n"
+    decl_stream << "#if defined(cl_intel_subgroups)\n"
                    "#pragma OPENCL EXTENSION cl_intel_subgroups : enable\n"
+                   "#elif defined(cl_khr_subgroups)\n"
+                   "#pragma OPENCL EXTENSION cl_khr_subgroups : enable\n"
                    "#endif\n\n";
   }
 
