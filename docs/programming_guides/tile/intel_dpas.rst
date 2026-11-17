@@ -459,6 +459,13 @@ these counts for a kernel's sub-groups, register mode and shared local memory:
     resident = resident_work_groups(ARC_B60, sub_groups=16, registers=256)  # 40
     wave_efficiency((2048 // 256) * (2048 // 128), resident)  # 0.8
 
+``examples/intel_kernels/gemm.py`` fills that last wave. The tiles of the whole
+waves run one per work-group, and the leftover ones are split along K into
+enough chunks to fill one more wave; each chunk writes its partial tile to a
+workspace, and a second kernel adds the chunks into ``C``. At
+``2048``\ :sup:`3` that takes the kernel from 71 to 83 TFLOP/s, against
+oneDNN's 80. Sizes that fill whole waves run unchanged.
+
 Two directions do not close the rest. A ``64 x 64`` tile cannot fit: its float32
 accumulator alone is 256 values per work-item, the entire large register file.
 Staging tiles through shared local memory mainly saves global traffic that
