@@ -354,8 +354,14 @@ def test_registered_tirx_ops_use_dispatch_attributes():
         "tirx.zero",
     }
 
-    # Tile instructions belong to the tile namespace of the target kind they run on.
-    backend_tile_prefixes = ("tirx.cuda.tile.", "tirx.trn.tile.", "tirx.opencl.tile.")
+    # Tile instructions belong to a backend's tile namespace: that of the target kind they
+    # run on, or a vendor's on a shared kind, as Intel's run on the opencl kind.
+    backend_tile_prefixes = (
+        "tirx.cuda.tile.",
+        "tirx.trn.tile.",
+        "tirx.opencl.tile.",
+        "tirx.intel.tile.",
+    )
     lingering_flat_tile = []
     for op_name in sorted(name for name in Op.list_op_names() if name.startswith("tirx.")):
         dispatcher = _op_attr(op_name, "FTileOpDispatch")

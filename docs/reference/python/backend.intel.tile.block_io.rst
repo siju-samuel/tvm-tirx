@@ -21,6 +21,6 @@ tvm_tirx.backend.intel.tile.block_io
 .. automodule:: tvm_tirx.backend.intel.tile.block_io
    :no-members:
 
-The instructions are exposed in TVMScript as ``T.opencl.tile.block_read`` and
-``T.opencl.tile.block_write``. See :doc:`/programming_guides/tile/intel_dpas`
+The instructions are exposed in TVMScript as ``T.intel.tile.block_read`` and
+``T.intel.tile.block_write``. See :doc:`/programming_guides/tile/intel_dpas`
 for a GEMM that uses them.

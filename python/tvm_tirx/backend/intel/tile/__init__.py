@@ -14,11 +14,12 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Intel Xe tile instructions.
+"""Intel Xe tile instructions, published as ``T.intel.tile``.
 
-These are OpenCL tile instructions, because a tile instruction belongs to the
-target kind it runs on and Intel GPUs run through the ``opencl`` kind.  Each one
-checks that its target is an Intel part before lowering.
+They run on the ``opencl`` target kind, which is how Intel GPUs are reached, at
+its sub-group scopes; the namespace says whose instructions they are, as
+``T.ptx`` does under the ``cuda`` kind.  Each one checks that its target is an
+Intel part before lowering.
 """
 
 from . import block_io, dpas, ewise

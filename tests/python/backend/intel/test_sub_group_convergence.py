@@ -40,7 +40,7 @@ FRAG = TileLayout(S[(1, 1, 8, 16) : (8, 8, 1, 1 @ sglid)])
 
 @T.macro
 def mma(ar, br, dr):
-    T.opencl.tile.dpas(
+    T.intel.tile.dpas(
         F16,
         dr.view(1, 1, 8, 16, layout=FRAG),
         ar.view(1, 1, 8, 16, layout=FRAG),

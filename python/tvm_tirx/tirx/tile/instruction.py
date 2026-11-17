@@ -69,10 +69,19 @@ class Instruction:
     workspaces: tuple[str, ...] = ()
     project: object = None
     lower: object = None
+    # The target kind and thread-scope backend the instruction runs on, when they are not
+    # its namespace: Intel's T.intel.tile instructions run on the opencl kind.
+    runs_on: str | None = None
 
     @property
     def backend(self):
+        """The namespace the instruction is published under, from its name."""
         return self.name.split(".")[1]
+
+    @property
+    def target_kind(self):
+        """The target kind it lowers for, and the backend of its thread scopes."""
+        return self.runs_on or self.backend
 
     def register(self):
         if self.name in SPECS:
@@ -168,10 +177,10 @@ class Instruction:
                 raise ValueError(
                     f"{self.name}: unsupported scope {value!r}; expected {self.scopes}"
                 )
-            value = ThreadScope(value if "." in value else f"{self.backend}.{value}")
+            value = ThreadScope(value if "." in value else f"{self.target_kind}.{value}")
         if not isinstance(value, ThreadScope):
             raise TypeError(f"{self.name}: scope must be a string or ThreadScope")
-        if value.backend != self.backend:
+        if value.backend != self.target_kind:
             raise ValueError(f"{self.name}: scope belongs to {value.backend}")
         if value.local_name not in self.scopes:
             raise ValueError(

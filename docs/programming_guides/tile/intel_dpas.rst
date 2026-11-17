@@ -20,10 +20,15 @@ Intel Xe Matrix Instructions
 
 Intel Xe GPUs multiply matrices with XMX engines, which OpenCL exposes as
 ``intel_sub_group_*_matrix_mad_*`` builtins (``cl_intel_subgroup_matrix_multiply_accumulate``).
-``T.opencl.tile.dpas`` issues one of them over fragments held in the registers
+``T.intel.tile.dpas`` issues one of them over fragments held in the registers
 of a 16-work-item sub-group, and checks at compile time that each fragment is
 laid out the way the hardware reads it. This guide multiplies an ``8 x 16``
 float16 matrix by a ``16 x 16`` one with float32 accumulation on an Arc Pro B60.
+
+The Intel instructions live in ``T.intel.tile``. They compile for the
+``opencl`` target kind, which is how Intel GPUs are reached, through the
+``intel/*`` targets, and run at its sub-group scopes; the namespace only says
+whose instructions they are, as ``T.ptx`` does under the ``cuda`` kind.
 
 Fragments and the Sub-group Lane Axis
 -------------------------------------
@@ -93,7 +98,7 @@ A Matrix Product in One Sub-group
                         cr[m] = C[m, lane]
                     for k in range(16):
                         br[k] = B[k, lane]
-                    T.opencl.tile.dpas(
+                    T.intel.tile.dpas(
                         "intel_sub_group_f16_f16_matrix_mad_k16",
                         cr.view(1, 1, 8, 16, layout=fragment),
                         ar.view(1, 1, 8, 16, layout=fragment),
@@ -147,7 +152,7 @@ as ``T.float32(0)``, broadcast across the accumulator. A sub-group computing a
     def fragment(r0, r1, rows):
         return TileLayout(S[(r0, r1, rows, 16) : (r1 * rows, rows, 1, 1 @ sglid)])
 
-    T.opencl.tile.dpas(
+    T.intel.tile.dpas(
         "intel_sub_group_f16_f16_matrix_mad_k16",
         dr.view(4, 2, 8, 16, layout=fragment(4, 2, 8)),
         ar.view(4, 1, 8, 16, layout=fragment(4, 1, 8)),
@@ -226,7 +231,7 @@ instructions. The 2D block reads of ``cl_intel_subgroup_2d_block_io`` move a
 whole block per instruction, and they produce exactly the fragments DPAS reads,
 so the same register views pass from one instruction to the next.
 
-``T.opencl.tile.block_read(instruction, dst, src, scope="subgroup")`` reads a
+``T.intel.tile.block_read(instruction, dst, src, scope="subgroup")`` reads a
 region of a row-major global matrix. The region is tiled into the instruction's
 blocks, and the register operand has one atom per block, with repeat axes over
 the row and column blocks. ``block_write`` stores registers back, with the
@@ -236,19 +241,19 @@ global region first. A sub-group's main loop then reads its ``A`` rows and
 .. code-block:: python
 
     for kb in range(K // 16):
-        T.opencl.tile.block_read(
+        T.intel.tile.block_read(
             "intel_sub_group_2d_block_read_16b_8r16x1c",
             ar.view(4, 1, 8, 16, layout=fragment(4, 1, 8)),
             A[row0 : row0 + 32, kb * 16 : kb * 16 + 16],
             scope="subgroup",
         )
-        T.opencl.tile.block_read(
+        T.intel.tile.block_read(
             "intel_sub_group_2d_block_read_transform_16b_16r16x1c",
             br.view(T.uint32.dtype).view(1, 2, 8, 16, layout=fragment(1, 2, 8)),
             B[kb * 16 : kb * 16 + 16, col0 : col0 + 32],
             scope="subgroup",
         )
-        T.opencl.tile.dpas(
+        T.intel.tile.dpas(
             "intel_sub_group_f16_f16_matrix_mad_k16",
             dr.view(4, 2, 8, 16, layout=fragment(4, 2, 8)),
             ar.view(4, 1, 8, 16, layout=fragment(4, 1, 8)),
@@ -256,7 +261,7 @@ global region first. A sub-group's main loop then reads its ``A`` rows and
             dr.view(4, 2, 8, 16, layout=fragment(4, 2, 8)),
             scope="subgroup",
         )
-    T.opencl.tile.block_write(
+    T.intel.tile.block_write(
         "intel_sub_group_2d_block_write_32b_8r16x1c",
         C[row0 : row0 + 32, col0 : col0 + 32],
         dr.view(4, 2, 8, 16, layout=fragment(4, 2, 8)),
@@ -291,7 +296,7 @@ with no repacking:
 .. code-block:: python
 
     # Bw: (batch, N, K // 2) uint32, the (N, K) float16 weights two halves per word
-    T.opencl.tile.block_read(
+    T.intel.tile.block_read(
         "intel_sub_group_2d_block_read_transpose_32b_16r8x1c",
         br.view(2, 1, 8, 16, layout=fragment(2, 1, 8)),
         Bw[bz, col0 : col0 + 32, kb * 8 : kb * 8 + 8],
@@ -308,7 +313,7 @@ same registers are passed to ``dpas`` as ``br.view(1, 2, 8, 16, ...)``.
 Epilogues
 ---------
 
-``T.opencl.tile.ewise(function, dst, *inputs, scope="subgroup")`` applies a
+``T.intel.tile.ewise(function, dst, *inputs, scope="subgroup")`` applies a
 scalar ``@T.function`` at every coordinate of a register fragment, so a bias, a
 scale or an activation runs on the accumulator before the block write stores it:
 
@@ -322,7 +327,7 @@ scale or an activation runs on the accumulator before the block write stores it:
     # axes presents it as the whole tile.
     for j in range(2):
         bias[j] = Bias[col0 + j * 16 + lane]
-    T.opencl.tile.ewise(
+    T.intel.tile.ewise(
         scale_bias_relu,
         dr.view(4, 2, 8, 16, layout=fragment(4, 2, 8)),
         dr.view(4, 2, 8, 16, layout=fragment(4, 2, 8)),
@@ -358,19 +363,19 @@ sub-group tile with a K step of 32:
 
     for kb in T.serial(K // 32, unroll=False):
         k = kb * 32
-        T.opencl.tile.block_prefetch(prefetch, A[row0 : row0 + 64, k + 32 : k + 64], scope="subgroup")
-        T.opencl.tile.block_prefetch(prefetch, B[k + 32 : k + 64, col0 : col0 + 32], scope="subgroup")
-        T.opencl.tile.block_read(
+        T.intel.tile.block_prefetch(prefetch, A[row0 : row0 + 64, k + 32 : k + 64], scope="subgroup")
+        T.intel.tile.block_prefetch(prefetch, B[k + 32 : k + 64, col0 : col0 + 32], scope="subgroup")
+        T.intel.tile.block_read(
             "intel_sub_group_2d_block_read_16b_32r16x1c",
             ar.view(2, 2, 32, 16, layout=a_read), A[row0 : row0 + 64, k : k + 32],
             scope="subgroup",
         )
-        T.opencl.tile.block_read(
+        T.intel.tile.block_read(
             "intel_sub_group_2d_block_read_transform_16b_32r16x1c",
             br.view(T.uint32.dtype).view(1, 2, 16, 16, layout=b_read),
             B[k : k + 32, col0 : col0 + 32], scope="subgroup",
         )
-        T.opencl.tile.dpas(
+        T.intel.tile.dpas(
             "intel_sub_group_f16_f16_matrix_mad_k16",
             dr.view(8, 2, 8, 16, layout=d),
             ar.view(8, 2, 8, 16, layout=a_dpas),

@@ -14,7 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""``T.opencl.tile.block_read`` and ``block_write``: Intel 2D block I/O.
+"""``T.intel.tile.block_read`` and ``block_write``: Intel 2D block I/O.
 
 The ``gpu`` tests move one block with each verified variant and compare every
 register word with the reference block computed in NumPy, so a wrong lane,
@@ -89,7 +89,7 @@ def read_module(name, y, x):
             with T.launch_thread("blockIdx.x", 1):
                 with T.launch_thread("threadIdx.x", 16) as lane:
                     r = T.alloc_local((total,), word)
-                    T.opencl.tile.block_read(
+                    T.intel.tile.block_read(
                         name,
                         r.view(1, v.blocks, v.words, 16, layout=frag(1, v.blocks, v.words)),
                         M[y : y + v.rows, x : x + v.cols],
@@ -154,7 +154,7 @@ def _reject(opencl_source, name, region, *, words=None, layout=None, cols=None, 
         with T.launch_thread("blockIdx.x", 1):
             with T.launch_thread("threadIdx.x", 16) as lane:
                 r = T.alloc_local((32,), word)
-                T.opencl.tile.block_read(
+                T.intel.tile.block_read(
                     name,
                     r.view(1, 1, words, 16, layout=layout),
                     M[y0:y1, x0:x1],
@@ -274,7 +274,7 @@ def write_module(name, y, x):
                     r = T.alloc_local((v.words,), word)
                     for q in range(v.words):
                         r[q] = W[q, lane]
-                    T.opencl.tile.block_write(
+                    T.intel.tile.block_write(
                         name,
                         M[y : y + v.rows, x : x + v.cols],
                         r.view(1, 1, v.words, 16, layout=frag(1, 1, v.words)),
@@ -359,19 +359,19 @@ def test_gemm_on_block_io():
                         for e in range(MR * NR * 8):
                             dr[e] = T.float32(0)
                         for kb in range(K // 16):
-                            T.opencl.tile.block_read(
+                            T.intel.tile.block_read(
                                 "intel_sub_group_2d_block_read_16b_8r16x1c",
                                 ar.view(MR, 1, 8, 16, layout=frag(MR, 1, 8)),
                                 A[row0 : row0 + TM, kb * 16 : kb * 16 + 16],
                                 scope="subgroup",
                             )
-                            T.opencl.tile.block_read(
+                            T.intel.tile.block_read(
                                 "intel_sub_group_2d_block_read_transform_16b_16r16x1c",
                                 br.view(T.uint32.dtype).view(1, NR, 8, 16, layout=frag(1, NR, 8)),
                                 B[kb * 16 : kb * 16 + 16, col0 : col0 + TN],
                                 scope="subgroup",
                             )
-                            T.opencl.tile.dpas(
+                            T.intel.tile.dpas(
                                 F16,
                                 dr.view(MR, NR, 8, 16, layout=frag(MR, NR, 8)),
                                 ar.view(MR, 1, 8, 16, layout=frag(MR, 1, 8)),
@@ -379,7 +379,7 @@ def test_gemm_on_block_io():
                                 dr.view(MR, NR, 8, 16, layout=frag(MR, NR, 8)),
                                 scope="subgroup",
                             )
-                        T.opencl.tile.block_write(
+                        T.intel.tile.block_write(
                             "intel_sub_group_2d_block_write_32b_8r16x1c",
                             C[row0 : row0 + TM, col0 : col0 + TN],
                             dr.view(MR, NR, 8, 16, layout=frag(MR, NR, 8)),
@@ -409,7 +409,7 @@ def _prefetch_function(name, region):
         T.func_attr({"tirx.noalias": True})
         with T.launch_thread("blockIdx.x", 1):
             with T.launch_thread("threadIdx.x", 16):
-                T.opencl.tile.block_prefetch(name, M[y0:y1, x0:x1], scope="subgroup")
+                T.intel.tile.block_prefetch(name, M[y0:y1, x0:x1], scope="subgroup")
 
     return main
 
@@ -455,7 +455,7 @@ def test_two_block_read_needs_consecutive_registers(opencl_source):
         with T.launch_thread("blockIdx.x", 1):
             with T.launch_thread("threadIdx.x", 16) as lane:
                 r = T.alloc_local((32,), "uint16")
-                T.opencl.tile.block_read(
+                T.intel.tile.block_read(
                     name, r.view(1, 2, 8, 16, layout=apart), M[0:8, 0:32], scope="subgroup"
                 )
                 for q in range(8):
@@ -506,25 +506,25 @@ def test_large_tile_gemm():
                             dr[e] = T.float32(0)
                         for kb in T.serial(K // TK, unroll=False):
                             k = kb * TK
-                            T.opencl.tile.block_prefetch(
+                            T.intel.tile.block_prefetch(
                                 prefetch, A[row0 : row0 + TM, k + TK : k + 2 * TK], scope="subgroup"
                             )
-                            T.opencl.tile.block_prefetch(
+                            T.intel.tile.block_prefetch(
                                 prefetch, B[k + TK : k + 2 * TK, col0 : col0 + TN], scope="subgroup"
                             )
-                            T.opencl.tile.block_read(
+                            T.intel.tile.block_read(
                                 "intel_sub_group_2d_block_read_16b_32r16x1c",
                                 ar.view(2, 2, 32, 16, layout=a_read),
                                 A[row0 : row0 + TM, k : k + TK],
                                 scope="subgroup",
                             )
-                            T.opencl.tile.block_read(
+                            T.intel.tile.block_read(
                                 "intel_sub_group_2d_block_read_transform_16b_32r16x1c",
                                 br.view(T.uint32.dtype).view(1, 2, 16, 16, layout=b_read),
                                 B[k : k + TK, col0 : col0 + TN],
                                 scope="subgroup",
                             )
-                            T.opencl.tile.dpas(
+                            T.intel.tile.dpas(
                                 "intel_sub_group_f16_f16_matrix_mad_k16",
                                 dr.view(8, 2, 8, 16, layout=d),
                                 ar.view(8, 2, 8, 16, layout=a_dpas),
@@ -532,7 +532,7 @@ def test_large_tile_gemm():
                                 dr.view(8, 2, 8, 16, layout=d),
                                 scope="subgroup",
                             )
-                        T.opencl.tile.block_write(
+                        T.intel.tile.block_write(
                             "intel_sub_group_2d_block_write_32b_8r16x1c",
                             C[row0 : row0 + TM, col0 : col0 + TN],
                             dr.view(8, 2, 8, 16, layout=d),
@@ -593,7 +593,7 @@ def test_batched_nt_gemm():
                             for e in range(MR * NR * 8):
                                 dr[e] = T.float32(0)
                             for kb in T.serial(K // 16, unroll=False):
-                                T.opencl.tile.block_read(
+                                T.intel.tile.block_read(
                                     "intel_sub_group_2d_block_read_16b_8r16x1c",
                                     ar.view(MR, 1, 8, 16, layout=frag(MR, 1, 8)),
                                     A[bz, row0 : row0 + TM, kb * 16 : kb * 16 + 16],
@@ -601,13 +601,13 @@ def test_batched_nt_gemm():
                                 )
                                 # 16 rows of B (n) by 8 words (16 halves of k): work-item n
                                 # receives row n, which is the B fragment's column n.
-                                T.opencl.tile.block_read(
+                                T.intel.tile.block_read(
                                     "intel_sub_group_2d_block_read_transpose_32b_16r8x1c",
                                     br.view(NR, 1, 8, 16, layout=_lay((NR, 1, 8, 16), (8, 8, 1))),
                                     Bw[bz, col0 : col0 + TN, kb * 8 : kb * 8 + 8],
                                     scope="subgroup",
                                 )
-                                T.opencl.tile.dpas(
+                                T.intel.tile.dpas(
                                     "intel_sub_group_f16_f16_matrix_mad_k16",
                                     dr.view(MR, NR, 8, 16, layout=d),
                                     ar.view(MR, 1, 8, 16, layout=frag(MR, 1, 8)),
@@ -615,7 +615,7 @@ def test_batched_nt_gemm():
                                     dr.view(MR, NR, 8, 16, layout=d),
                                     scope="subgroup",
                                 )
-                            T.opencl.tile.block_write(
+                            T.intel.tile.block_write(
                                 "intel_sub_group_2d_block_write_32b_8r16x1c",
                                 C[bz, row0 : row0 + TM, col0 : col0 + TN],
                                 dr.view(MR, NR, 8, 16, layout=d),
@@ -650,7 +650,7 @@ def test_batched_surface_needs_an_aligned_matrix_start(opencl_source):
         with T.launch_thread("blockIdx.x", 1):
             with T.launch_thread("threadIdx.x", 16) as lane:
                 r = T.alloc_local((8,), "uint16")
-                T.opencl.tile.block_read(
+                T.intel.tile.block_read(
                     _name("read", 16, 8, 16),
                     r.view(1, 1, 8, 16, layout=frag(1, 1, 8)),
                     M[1, 0:8, 0:16],

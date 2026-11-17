@@ -21,7 +21,7 @@ tvm_tirx.backend.intel.tile.ewise
 .. automodule:: tvm_tirx.backend.intel.tile.ewise
    :no-members:
 
-The instruction is exposed in TVMScript as ``T.opencl.tile.ewise``.
+The instruction is exposed in TVMScript as ``T.intel.tile.ewise``.
 
 .. currentmodule:: tvm_tirx.backend.intel.tile.ewise
 

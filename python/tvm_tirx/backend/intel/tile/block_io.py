@@ -16,7 +16,7 @@
 # under the License.
 """Intel Xe 2D block reads and writes between global memory and sub-group fragments.
 
-``T.opencl.tile.block_read(instruction, dst, src, scope="subgroup")`` loads a
+``T.intel.tile.block_read(instruction, dst, src, scope="subgroup")`` loads a
 region of a row-major global matrix into sub-group registers with the named
 ``cl_intel_subgroup_2d_block_io`` builtin, and ``block_write`` stores registers
 back.  One instruction moves a whole block, which is what keeps the XMX engines
@@ -33,7 +33,7 @@ column blocks::
 
 Every atom uses the mapping the DPAS operands use -- word ``(row, col)`` lives in
 work-item ``col`` at register component ``row`` -- so a fragment flows from
-``block_read`` to ``T.opencl.tile.dpas`` to ``block_write`` with the same view.
+``block_read`` to ``T.intel.tile.dpas`` to ``block_write`` with the same view.
 What a word holds depends on the variant:
 
 ==========================================  ======  ======================================
@@ -68,7 +68,7 @@ when violated, so lowering requires a proof of both: the row pitch must be a
 multiple of 16 bytes, and every block's x offset must be 4-byte aligned.  The
 tensor must be at least 4-byte aligned, which was the coarsest alignment tested.
 
-``T.opencl.tile.block_prefetch(instruction, src, scope="subgroup")`` takes the
+``T.intel.tile.block_prefetch(instruction, src, scope="subgroup")`` takes the
 same global operand and pulls its blocks into cache without touching registers,
 so a later read of them hits.  ``prefetch_16b_{1,...,32}r16x{1,2}c`` and
 ``prefetch_8b_{1,...,32}r32x{1,2}c`` are accepted, the ``x2c`` forms covering
@@ -363,11 +363,12 @@ def _lower(view, sctx, direction):
 
 def _instruction(direction):
     return Instruction(
-        f"tirx.opencl.tile.block_{direction}",
+        f"tirx.intel.tile.block_{direction}",
         f"intel_block_{direction}",
         (Operand("instruction"), Operand("dst", "region"), Operand("src", "region")),
         ("subgroup",),
         lower=lambda view, sctx: _lower(view, sctx, direction),
+        runs_on="opencl",
     ).register()
 
 
@@ -376,10 +377,11 @@ publish("block_write", _instruction("write"))
 publish(
     "block_prefetch",
     Instruction(
-        "tirx.opencl.tile.block_prefetch",
+        "tirx.intel.tile.block_prefetch",
         "intel_block_prefetch",
         (Operand("instruction"), Operand("src", "region")),
         ("subgroup",),
         lower=_lower_prefetch,
+        runs_on="opencl",
     ).register(),
 )

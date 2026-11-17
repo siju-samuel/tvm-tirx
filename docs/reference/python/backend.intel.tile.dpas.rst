@@ -21,5 +21,5 @@ tvm_tirx.backend.intel.tile.dpas
 .. automodule:: tvm_tirx.backend.intel.tile.dpas
    :no-members:
 
-The instruction is exposed in TVMScript as ``T.opencl.tile.dpas``. See
+The instruction is exposed in TVMScript as ``T.intel.tile.dpas``. See
 :doc:`/programming_guides/tile/intel_dpas` for a complete kernel.

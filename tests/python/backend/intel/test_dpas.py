@@ -14,7 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""``T.opencl.tile.dpas``: Intel Xe matrix multiply-accumulate on sub-group fragments.
+"""``T.intel.tile.dpas``: Intel Xe matrix multiply-accumulate on sub-group fragments.
 
 The codegen and verifier tests need no device.  The ``gpu`` tests run each
 builtin on an Intel GPU and require bit-exact agreement with a reference
@@ -86,7 +86,7 @@ def matmul_module(instruction, elem, acc, kelems, mr, nr, kr, m=8):
                         br[(k * nr + j) * kelems + e] = B[k * kelems + e, j * 16 + lane]
                     for i, j, r in T.grid(mr, nr, m):
                         dr[(i * nr + j) * m + r] = C[i * m + r, j * 16 + lane]
-                    T.opencl.tile.dpas(
+                    T.intel.tile.dpas(
                         instruction,
                         dr.view(mr, nr, m, 16, layout=frag(mr, nr, m)),
                         ar.view(a_word).view(mr, kr, m, 16, layout=frag(mr, kr, m)),
@@ -115,7 +115,7 @@ def single_module(a_layout=None, d_layout=None, b_view=True, instruction=F16, ac
                 ar = T.alloc_local((16,), "float16")
                 br = T.alloc_local((16,), "float16")
                 dr = T.alloc_local((16,), acc)
-                T.opencl.tile.dpas(
+                T.intel.tile.dpas(
                     instruction,
                     dr.view(1, 1, 8, 16, layout=d_layout),
                     ar.view(1, 1, 8, 16, layout=a_layout),
@@ -196,7 +196,7 @@ def test_accumulator_repeats_must_not_alias(opencl_source):
                 ar = T.alloc_local((16,), "float16")
                 br = T.alloc_local((16,), "float16")
                 dr = T.alloc_local((8,), "float32")
-                T.opencl.tile.dpas(
+                T.intel.tile.dpas(
                     F16,
                     dr.view(2, 1, 8, 16, layout=aliased),
                     ar.view(2, 1, 8, 16, layout=frag(2, 1, 8)),
@@ -217,7 +217,7 @@ def test_print_parse_round_trip():
 
     function = single_module()
     text = function.script()
-    assert "T.opencl.tile.dpas(" in text
+    assert "T.intel.tile.dpas(" in text
     reparsed = tvm_tirx.script.from_source(text, extra_vars={"T": T, "I": I})
     assert_structural_equal(function, reparsed)
 
@@ -325,7 +325,7 @@ def test_gemm_across_work_groups():
                                 ar[i * 8 + r] = A[row0 + i * 8 + r, kb * 16 + lane]
                             for j, e in T.grid(NR, 16):
                                 br[j * 16 + e] = B[kb * 16 + e, col0 + j * 16 + lane]
-                            T.opencl.tile.dpas(
+                            T.intel.tile.dpas(
                                 F16,
                                 dr.view(MR, NR, 8, 16, layout=frag(MR, NR, 8)),
                                 ar.view(MR, 1, 8, 16, layout=frag(MR, 1, 8)),
@@ -384,7 +384,7 @@ def tf32_module(mr, nr, kr, m):
                         br[(k * nr + j) * 8 + e] = B[k * 8 + e, j * 16 + lane]
                     for i, j, r in T.grid(mr, nr, m):
                         dr[(i * nr + j) * m + r] = C[i * m + r, j * 16 + lane]
-                    T.opencl.tile.dpas(
+                    T.intel.tile.dpas(
                         "intel_sub_group_tf32_tf32_matrix_mad_k8",
                         dr.view(mr, nr, m, 16, layout=frag(mr, nr, m)),
                         ar.view(mr, kr, comps, 2, 8, layout=a_layout),
@@ -422,7 +422,7 @@ def bf16acc_module(mr, nr, kr, m):
                         br[(k * nr + j) * 16 + e] = B[k * 16 + e, j * 16 + lane]
                     for i, j, r in T.grid(mr, nr, m):
                         dr[(i * nr + j) * m + r] = C[i * m + r, j * 16 + lane]
-                    T.opencl.tile.dpas(
+                    T.intel.tile.dpas(
                         "intel_sub_group_bf16_bf16_matrix_mad_k16",
                         dr.view(mr, nr, m, 16, layout=frag(mr, nr, m)),
                         ar.view(mr, kr, m, 16, layout=frag(mr, kr, m)),
@@ -461,7 +461,7 @@ def test_tf32_rejects_the_ordinary_a_layout(opencl_source):
                 br = T.alloc_local((8,), "float32")
                 dr = T.alloc_local((8,), "float32")
                 wrong = TileLayout(S[(1, 1, 4, 2, 8) : (4, 4, 1, 1 @ sglid, 2 @ sglid)])
-                T.opencl.tile.dpas(
+                T.intel.tile.dpas(
                     "intel_sub_group_tf32_tf32_matrix_mad_k8",
                     dr.view(1, 1, 8, 16, layout=frag(1, 1, 8)),
                     ar.view(1, 1, 4, 2, 8, layout=wrong),

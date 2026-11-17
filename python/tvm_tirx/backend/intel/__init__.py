@@ -18,17 +18,21 @@
 
 from importlib import import_module
 
-_LAZY_SUBMODULES = {"target_tags", "tile"}
+_LAZY_SUBMODULES = {"script", "target_tags", "tile"}
 
 
 def register_backend():
     """Register Intel-owned Python semantics."""
     import tvm_tirx.backend as backend  # pylint: disable=import-outside-toplevel
+    from tvm_tirx.tirx.script.ir_builder import op as builder_op
 
     backend.load("opencl")
     import_module(f"{__name__}.target_tags")
-    # Registered after opencl, which owns the sub-group scope and layout axis these use.
+    # The script namespace first, so registering the instructions publishes into it; and
+    # after opencl, which owns the sub-group scope and layout axis they use.
+    script = import_module(f"{__name__}.script")
     import_module(f"{__name__}.tile")
+    builder_op.register_script_namespace("intel", script)
 
 
 def __getattr__(name: str):
@@ -37,4 +41,4 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-__all__ = ["register_backend", "target_tags", "tile"]
+__all__ = ["register_backend", "script", "target_tags", "tile"]

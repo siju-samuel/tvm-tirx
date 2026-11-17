@@ -16,7 +16,7 @@
 # under the License.
 """Intel Xe matrix multiply-accumulate (DPAS) over sub-group register fragments.
 
-``T.opencl.tile.dpas(instruction, D, A, B, C, scope="subgroup")`` computes
+``T.intel.tile.dpas(instruction, D, A, B, C, scope="subgroup")`` computes
 ``D = A @ B + C`` with the named ``cl_intel_subgroup_matrix_multiply_accumulate``
 builtin.  One sub-group of 16 work-items executes each instruction on fragments
 held in its registers.
@@ -214,7 +214,7 @@ def lower(view, sctx):
 
 
 _construct = Instruction(
-    "tirx.opencl.tile.dpas",
+    "tirx.intel.tile.dpas",
     "intel_dpas",
     (
         Operand("instruction"),
@@ -225,6 +225,7 @@ _construct = Instruction(
     ),
     ("subgroup",),
     lower=lower,
+    runs_on="opencl",
 ).register()
 
 

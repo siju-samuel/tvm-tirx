@@ -254,9 +254,9 @@ def run_dispatch(call, sctx) -> Stmt:
 
     view = TensorCall.decode(call)
     view.call.validate()
-    if sctx.target.kind.name != view.spec.backend:
+    if sctx.target.kind.name != view.spec.target_kind:
         raise ValueError(
-            f"{view.op.name}: target {sctx.target.kind.name} does not match {view.spec.backend}"
+            f"{view.op.name}: target {sctx.target.kind.name} does not match {view.spec.target_kind}"
         )
     try:
         result = view.spec.lower(view, sctx)

@@ -14,7 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""``T.opencl.tile.ewise``: a scalar function over sub-group register fragments."""
+"""``T.intel.tile.ewise``: a scalar function over sub-group register fragments."""
 
 import numpy as np
 import pytest
@@ -85,14 +85,14 @@ def _single(src_layout, scope="subgroup", divergent=False):
                     for r in range(8):
                         sr[r] = T.Cast("float32", lane)
                     if divergent and lane < 4:
-                        T.opencl.tile.ewise(
+                        T.intel.tile.ewise(
                             plus_one,
                             dr.view(1, 1, 8, 16, layout=lay((1, 1, 8, 16), (8, 8, 1))),
                             sr.view(1, 1, 8, 16, layout=src_layout),
                             scope=scope,
                         )
                     else:
-                        T.opencl.tile.ewise(
+                        T.intel.tile.ewise(
                             plus_one,
                             dr.view(1, 1, 8, 16, layout=lay((1, 1, 8, 16), (8, 8, 1))),
                             sr.view(1, 1, 8, 16, layout=src_layout),
@@ -170,13 +170,13 @@ def test_gemm_epilogue():
                         for j in range(NR):
                             bias[j] = Bias[col0 + j * 16 + lane]
                         for kb in T.serial(K // 16, unroll=False):
-                            T.opencl.tile.block_read(
+                            T.intel.tile.block_read(
                                 "intel_sub_group_2d_block_read_16b_8r16x1c",
                                 ar.view(MR, 1, 8, 16, layout=lay((MR, 1, 8, 16), (8, 8, 1))),
                                 A[row0 : row0 + TM, kb * 16 : kb * 16 + 16],
                                 scope="subgroup",
                             )
-                            T.opencl.tile.block_read(
+                            T.intel.tile.block_read(
                                 "intel_sub_group_2d_block_read_transform_16b_16r16x1c",
                                 br.view(T.uint32.dtype).view(
                                     1, NR, 8, 16, layout=lay((1, NR, 8, 16), (NR * 8, 8, 1))
@@ -184,7 +184,7 @@ def test_gemm_epilogue():
                                 B[kb * 16 : kb * 16 + 16, col0 : col0 + TN],
                                 scope="subgroup",
                             )
-                            T.opencl.tile.dpas(
+                            T.intel.tile.dpas(
                                 F16,
                                 dr.view(MR, NR, 8, 16, layout=d),
                                 ar.view(MR, 1, 8, 16, layout=lay((MR, 1, 8, 16), (8, 8, 1))),
@@ -194,7 +194,7 @@ def test_gemm_epilogue():
                                 dr.view(MR, NR, 8, 16, layout=d),
                                 scope="subgroup",
                             )
-                        T.opencl.tile.ewise(
+                        T.intel.tile.ewise(
                             scale_bias_relu,
                             dr.view(MR, NR, 8, 16, layout=d),
                             dr.view(MR, NR, 8, 16, layout=d),
@@ -202,7 +202,7 @@ def test_gemm_epilogue():
                             T.float32(alpha),
                             scope="subgroup",
                         )
-                        T.opencl.tile.block_write(
+                        T.intel.tile.block_write(
                             "intel_sub_group_2d_block_write_32b_8r16x1c",
                             C[row0 : row0 + TM, col0 : col0 + TN],
                             dr.view(MR, NR, 8, 16, layout=d),

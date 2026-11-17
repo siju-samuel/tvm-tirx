@@ -16,7 +16,7 @@
 # under the License.
 """A scalar function applied to every element of sub-group register fragments.
 
-``T.opencl.tile.ewise(function, dst, *inputs, scope="subgroup")`` computes
+``T.intel.tile.ewise(function, dst, *inputs, scope="subgroup")`` computes
 ``dst[c] = function(inputs[0][c], ...)`` at every logical coordinate ``c`` of
 ``dst``.  It is how an epilogue -- a bias, a scale, an activation -- runs on a
 matrix tile while it is still in the registers DPAS left it in, before a block
@@ -222,11 +222,12 @@ def _lower(view, sctx):
 
 
 _construct = Instruction(
-    "tirx.opencl.tile.ewise",
+    "tirx.intel.tile.ewise",
     "intel_ewise",
     (Operand("function"), Operand("dst", "region"), Operand("inputs", default=None)),
     ("thread", "subgroup"),
     lower=_lower,
+    runs_on="opencl",
 ).register()
 
 
