@@ -36,6 +36,7 @@ python examples/intel_kernels/gemm.py --bench "2048^3"
 |---|---|
 | [`gemm.py`](gemm.py) | fp16 GEMM with float32 accumulation on DPAS; the leftover tiles of a partly full last wave are split along K |
 | [`attention.py`](attention.py) | FlashAttention prefill, head dimension 64, causal or not, with online softmax in registers |
+| [`rmsnorm.py`](rmsnorm.py) | RMSNorm in float16 with 1D sub-group block reads and writes; a row is read once, by four sub-groups that meet in shared local memory |
 
 `tests/python/backend/intel/test_intel_kernels.py` runs the modules' correctness
 checks on an Intel GPU.
