@@ -166,7 +166,7 @@ def plan(*, batch, kv_heads, head_dim, max_len, splits=None, sub_groups=None, **
     larger work-groups by up to 28% whenever the shares were long.  When they are
     at most 4 pages and there are at least 16 sequence-head pairs, the shares
     instead stay in one work-group and merge in shared local memory, which saves
-    the merge kernel's launch: 12.8 instead of 17 us for 4 sequences of 300
+    the merge kernel's launch: 20.0 instead of 24.6 us for 4 sequences of 300
     tokens.  A work-group's shares are 8 rows of ``head_dim`` floats each, at
     most 64 KiB of them.
     """

@@ -91,8 +91,9 @@ def bench_interleaved(
         last one's tail, which in a model, where other work comes between, it
         cannot.  Two plans of a paged decode attention 3% apart back to back on
         an Arc Pro B60 were 28% apart with a one-work-group kernel between.
-        ``between`` is timed alone in each round, the same way, and its time
-        taken off every sample of the round.
+        Each sample includes ``between``.  Its time alone is no measure of what
+        it adds: alone, the B60's one-work-group kernel took 5.3 us a launch,
+        the host's launch rate, but after a 165 us kernel it added 1.8 us.
 
     Returns
     -------
@@ -134,9 +135,8 @@ def bench_interleaved(
 
     samples = {name: [] for name in funcs}
     for _ in range(rounds):
-        base = 0.0 if between is None else per_call_us(between)
         for name, fn in funcs.items():
-            samples[name].append(per_call_us(fn if between is None else followed(fn)) - base)
+            samples[name].append(per_call_us(fn if between is None else followed(fn)))
     return {name: Measurement(tuple(values)) for name, values in samples.items()}
 
 

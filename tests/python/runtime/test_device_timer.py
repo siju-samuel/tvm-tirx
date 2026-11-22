@@ -54,8 +54,8 @@ def test_rounds_run_every_candidate_in_turn():
     assert calls == ["a"] * 3 + ["b"] * 3 + ["a"] * 3 + ["b"] * 3 + ["a"] * 3 + ["b"] * 3
 
 
-def test_between_follows_every_call_and_its_time_is_taken_off(monkeypatch):
-    """A fake clock that each closure advances makes the subtraction exact."""
+def test_between_follows_every_call_and_counts_in_the_samples(monkeypatch):
+    """A fake clock that each closure advances makes the samples exact."""
     from tvm_tirx.testing import device_bench
 
     clock = [0.0]
@@ -77,9 +77,8 @@ def test_between_follows_every_call_and_its_time_is_taken_off(monkeypatch):
         warmup=1,
         between=tick("x", 1e-6),
     )
-    # Each round times the separator alone, then a with it after every call.
-    assert calls == (["x"] * 3 + ["a", "x"] * 3) * 2
-    assert results["a"].samples_us == pytest.approx((3.0, 3.0))
+    assert calls == ["a", "x"] * 3 * 2
+    assert results["a"].samples_us == pytest.approx((4.0, 4.0))
 
 
 N = 1 << 20
@@ -144,8 +143,8 @@ def test_separator_runs_between_calls():
         results = bench_interleaved(
             {"noop": lambda: None}, dev, rounds=2, number=3, warmup=1, between=launch
         )
-        # Two rounds, each timing the separator alone and then after every call.
-        np.testing.assert_array_equal(launch.buffer.numpy(), 2 * 2 * (1 + 3))
+        # Two rounds of a warmup call and three timed ones, each followed by the separator.
+        np.testing.assert_array_equal(launch.buffer.numpy(), 2 * (1 + 3))
         assert len(results["noop"].samples_us) == 2
 
     tvm_tirx.testing.run_with_gpu_lock(run_and_check)
