@@ -25,8 +25,8 @@ kernel, once, as int4 kernels usually do:
 * A value ``q`` is the nibble ``q + 8``, eight to a ``uint32`` word along K, and
   element ``8 w + i`` of a row sits in word ``w`` at bit ``4 (i // 2) +
   16 (i % 2)``.  Each pair of neighbours is then one mask away from two float16
-  values: OR-ing them under 0x6400 makes ``1024 + q + 8``, and a half2 subtract
-  and multiply give the pair scaled, already as the VNNI word DPAS reads.
+  values: OR-ing them under 0x6400 makes ``h = 1024 + q + 8``, already as the
+  VNNI word DPAS reads.
 * Each 16 columns by 64 of K, the weights one sub-group needs per step, are 512
   contiguous bytes, word-major, so one 1D sub-group block read hands work-item
   ``n`` the eight words of column ``n``.
@@ -34,8 +34,13 @@ kernel, once, as int4 kernels usually do:
 
 Each sub-group computes 16 output columns.  The few rows of X come in through 2D
 block reads, which return zeros past the last row, so up to 32 rows run in one
-pass.  A decode product has too few output tiles to fill the GPU, so K is split
-among work-groups, and a second kernel adds the partial sums.
+pass.  For up to 16 rows, DPAS takes the ``h`` as they are: ``X (h - 1032) s``
+is ``(X h + X (-1032)) s``, so a second DPAS against a constant -1032 and one
+multiply-add per group of 128 replace a half2 subtract and multiply per weight
+pair, which IGC splits into halves and back with three moves each.  For more
+rows the extra DPAS costs more than that saves, and the pairs are scaled
+before DPAS.  A decode product has too few output tiles to fill the GPU, so K
+is split among work-groups, and a second kernel adds the partial sums.
 
 The module follows TIRx-kernels' kernel protocol.
 """
@@ -74,6 +79,11 @@ def _lay(shape, strides):
     return TileLayout(S[tuple(shape) : (*strides, 1 @ sglid)])
 
 
+@T.function(private=True)
+def _scaled_add(y: T.float32, a: T.float32, s: T.float32) -> T.float32:
+    return y + a * s
+
+
 def get_kernel(*, backend_config=None, m, n, k, splits=None, **_):
     """The GEMM as an IRModule whose ``main(X, Wt, Sc, Y, P)`` launches one or two kernels.
 
@@ -108,6 +118,8 @@ def get_kernel(*, backend_config=None, m, n, k, splits=None, **_):
     w_read = _lay((1, 1, 8, 16), (8, 8, 1))  # the 8 packed words of each work-item's column
     b_dpas = _lay((4, 1, 8, 16), (8, 8, 1))  # VNNI words: register kb * 8 + word
     d = _lay((MR, 1, 8, 16), (8, 8, 1))
+    per_column = _lay((MR, 1, 8, 16), (0, 0, 0))  # the work-item's column, on every row
+    fold = MR <= 2  # DPAS the raw h, and -1032; see the module docstring
     total = splits * TM
     reduce_threads = 256
 
@@ -130,49 +142,105 @@ def get_kernel(*, backend_config=None, m, n, k, splits=None, **_):
                         br = T.alloc_local((4 * 8,), "uint32")
                         dr = T.alloc_local((MR * 8,), "float32")
                         scale = T.alloc_local((1,), "float16")
+                        scale32 = T.alloc_local((1,), "float32")
+                        acc = T.alloc_local((MR * 8,), "float32")
+                        neg = T.alloc_local((4 * 8,), "uint32")
                         lane = tx % 16
                         col0 = (gx * SUB_GROUPS + tx // 16) * 16
                         for e in range(MR * 8):
                             dr[e] = T.float32(0)
-                        for s in T.serial(steps, unroll=False):
-                            T.intel.tile.block_read(
-                                "intel_sub_group_block_read8",
-                                wr.view(1, 1, 8, 16, layout=w_read),
-                                Wt[col0 // 16, sp * steps + s, 0:128],
-                                scope="subgroup",
-                            )
-                            kk = (sp * steps + s) * STEP
-                            T.intel.tile.block_read(
-                                "intel_sub_group_2d_block_read_16b_8r16x2c",
-                                ar.view(MR, 4, 8, 16, layout=a_read),
-                                X[0:TM, kk : kk + STEP],
-                                scope="subgroup",
-                            )
-                            scale[0] = Sc[kk // GROUP, col0 + lane]
-                            # VNNI word p of K block b is the pair 16 b + 2 p, 16 b + 2 p + 1,
-                            # whose nibbles sit at bits 4 j and 16 + 4 j of packed word
-                            # 2 b + p // 4, j = p % 4.  OR-ing them under 0x6400 makes two
-                            # float16 values 1024 + q + 8, so a half2 subtract and multiply
-                            # give the pair scaled, already as the VNNI word.
-                            for b in T.unroll(4):
-                                for p in T.unroll(8):
-                                    word = wr[b * 2 + p // 4]
-                                    bits = (
-                                        (word >> T.uint32(p % 4 * 4)) & T.uint32(0x000F000F)
-                                    ) | T.uint32(0x64006400)
-                                    pair = T.reinterpret(bits, ty="float16x2")
-                                    value = (pair - T.Broadcast(T.float16(1032), 2)) * T.Broadcast(
-                                        scale[0], 2
+                        if fold:
+                            for e in range(4 * 8):
+                                neg[e] = T.uint32(0xE408E408)  # -1032 in both halves
+                            for g in T.serial(steps // 2, unroll=False):
+                                for e in range(MR * 8):
+                                    acc[e] = T.float32(0)
+                                for t in T.unroll(2):
+                                    step = sp * steps + g * 2 + t
+                                    T.intel.tile.block_read(
+                                        "intel_sub_group_block_read8",
+                                        wr.view(1, 1, 8, 16, layout=w_read),
+                                        Wt[col0 // 16, step, 0:128],
+                                        scope="subgroup",
                                     )
-                                    br[b * 8 + p] = T.reinterpret(value, ty="uint32")
-                            T.intel.tile.dpas(
-                                F16,
-                                dr.view(MR, 1, 8, 16, layout=d),
-                                ar.view(MR, 4, 8, 16, layout=a_dpas),
-                                br.view(4, 1, 8, 16, layout=b_dpas),
-                                dr.view(MR, 1, 8, 16, layout=d),
-                                scope="subgroup",
-                            )
+                                    T.intel.tile.block_read(
+                                        "intel_sub_group_2d_block_read_16b_8r16x2c",
+                                        ar.view(MR, 4, 8, 16, layout=a_read),
+                                        X[0:TM, step * STEP : step * STEP + STEP],
+                                        scope="subgroup",
+                                    )
+                                    for b in T.unroll(4):
+                                        for p in T.unroll(8):
+                                            word = wr[b * 2 + p // 4]
+                                            br[b * 8 + p] = (
+                                                (word >> T.uint32(p % 4 * 4)) & T.uint32(0x000F000F)
+                                            ) | T.uint32(0x64006400)
+                                    T.intel.tile.dpas(
+                                        F16,
+                                        acc.view(MR, 1, 8, 16, layout=d),
+                                        ar.view(MR, 4, 8, 16, layout=a_dpas),
+                                        br.view(4, 1, 8, 16, layout=b_dpas),
+                                        acc.view(MR, 1, 8, 16, layout=d),
+                                        scope="subgroup",
+                                    )
+                                    T.intel.tile.dpas(
+                                        F16,
+                                        acc.view(MR, 1, 8, 16, layout=d),
+                                        ar.view(MR, 4, 8, 16, layout=a_dpas),
+                                        neg.view(4, 1, 8, 16, layout=b_dpas),
+                                        acc.view(MR, 1, 8, 16, layout=d),
+                                        scope="subgroup",
+                                    )
+                                scale32[0] = T.Cast(
+                                    "float32", Sc[(sp * steps + g * 2) * STEP // GROUP, col0 + lane]
+                                )
+                                T.intel.tile.ewise(
+                                    _scaled_add,
+                                    dr.view(MR, 1, 8, 16, layout=d),
+                                    dr.view(MR, 1, 8, 16, layout=d),
+                                    acc.view(MR, 1, 8, 16, layout=d),
+                                    scale32.view(MR, 1, 8, 16, layout=per_column),
+                                )
+                        else:
+                            for s in T.serial(steps, unroll=False):
+                                T.intel.tile.block_read(
+                                    "intel_sub_group_block_read8",
+                                    wr.view(1, 1, 8, 16, layout=w_read),
+                                    Wt[col0 // 16, sp * steps + s, 0:128],
+                                    scope="subgroup",
+                                )
+                                kk = (sp * steps + s) * STEP
+                                T.intel.tile.block_read(
+                                    "intel_sub_group_2d_block_read_16b_8r16x2c",
+                                    ar.view(MR, 4, 8, 16, layout=a_read),
+                                    X[0:TM, kk : kk + STEP],
+                                    scope="subgroup",
+                                )
+                                scale[0] = Sc[kk // GROUP, col0 + lane]
+                                # VNNI word p of K block b is the pair 16 b + 2 p, 16 b + 2 p + 1,
+                                # whose nibbles sit at bits 4 j and 16 + 4 j of packed word
+                                # 2 b + p // 4, j = p % 4.  OR-ing them under 0x6400 makes two
+                                # float16 values 1024 + q + 8, so a half2 subtract and multiply
+                                # give the pair scaled, already as the VNNI word.
+                                for b in T.unroll(4):
+                                    for p in T.unroll(8):
+                                        word = wr[b * 2 + p // 4]
+                                        bits = (
+                                            (word >> T.uint32(p % 4 * 4)) & T.uint32(0x000F000F)
+                                        ) | T.uint32(0x64006400)
+                                        pair = T.reinterpret(bits, ty="float16x2")
+                                        value = (
+                                            pair - T.Broadcast(T.float16(1032), 2)
+                                        ) * T.Broadcast(scale[0], 2)
+                                        br[b * 8 + p] = T.reinterpret(value, ty="uint32")
+                                T.intel.tile.dpas(
+                                    F16,
+                                    dr.view(MR, 1, 8, 16, layout=d),
+                                    ar.view(MR, 4, 8, 16, layout=a_dpas),
+                                    br.view(4, 1, 8, 16, layout=b_dpas),
+                                    dr.view(MR, 1, 8, 16, layout=d),
+                                    scope="subgroup",
+                                )
                         if splits == 1:
                             T.intel.tile.block_write(
                                 "intel_sub_group_2d_block_write_32b_8r16x1c",
@@ -204,16 +272,17 @@ def get_kernel(*, backend_config=None, m, n, k, splits=None, **_):
 
 
 def _splits(m, n, k, splits=None):
-    """How many work-groups share each output tile's K.
+    """How many work-groups share each output tile's K, in whole groups of 128.
 
-    Enough for about 256 work-groups when X is one fragment, fewer as it grows:
-    each fragment adds DPAS work per weight read.  On an Arc Pro B60, 4096 x 4096
-    ran fastest with 8 splits for one row of X and 2 for 32."""
+    About 1024 sub-groups for up to 16 rows of X and 512 for more, about one wave
+    on an Arc Pro B60: a launch a little over a wave left the last one nearly
+    empty, and 8 x 11008 x 4096 ran 26% faster in one wave than in 1.1."""
     groups_n = n // (SUB_GROUPS * 16)
     if splits is None:
-        splits = max(1, min(k // STEP, 256 // math.ceil(m / 8) // groups_n))
-    splits = min(splits, k // STEP)
-    while (k // STEP) % splits:
+        target = 1024 if m <= 16 else 512
+        splits = max(1, target // (groups_n * SUB_GROUPS))
+    splits = min(splits, k // GROUP)
+    while (k // GROUP) % splits:
         splits -= 1
     return splits
 
