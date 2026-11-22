@@ -29,7 +29,9 @@ expert's rows its tile index falls in.  Expert boundaries need no masking code:
 the kernel addresses ``X`` and ``Y`` through views whose height is the tile's
 expert's last row, so the 2D block reads return zeros past it and the block
 writes drop rows past it, both in hardware.  A work-group past the last tile
-gets a tile at row ``T``, which reads nothing and writes nothing.  The weights
+gets a tile at row ``T`` and skips the K loop: its tile, found by every
+work-item and read back from shared local memory, is provably the same across
+each sub-group, as a loop around block reads needs.  The weights
 come in through the transposed block read, which hands work-item ``n`` row
 ``n`` of ``W[e]`` already in the VNNI pairs DPAS reads.  Each step covers 32 of
 K and prefetches the next step's tokens and weights, as the dense GEMM does.
@@ -154,9 +156,17 @@ def get_kernel(
                                 info[1] = offsets[e + 1]
                                 info[2] = e
                             info[3] = info[3] + count
-                        row0 = info[0] + tx // 16 // SG_N * TM
-                        end = info[1]
-                        expert = info[2]
+                        # Every work-item found the same tile.  Read back from shared local
+                        # memory, it is provably the same across each sub-group, so a tile
+                        # past the last one can skip the K loop.
+                        tile = T.alloc_shared((3,), "int32")
+                        for e in range(3):
+                            tile[e] = info[e]
+                        T.gpu_storage_sync("shared")
+                        row0 = tile[0] + tx // 16 // SG_N * TM
+                        end = tile[1]
+                        expert = tile[2]
+                        steps = T.if_then_else(tile[0] < tokens, K // TK, 0)
                         col0 = nb * WN + tx // 16 % SG_N * TN
                         Xe = T.decl_tensor(
                             X.data, ty_args=[T.Tensor((end, K), "float16", data=X.data)]
@@ -170,7 +180,7 @@ def get_kernel(
                         )
                         for e in range(MR * NR * 8):
                             dr[e] = T.float32(0)
-                        for kb in T.serial(K // TK, unroll=False):
+                        for kb in T.serial(steps, unroll=False):
                             kk = kb * TK
                             T.intel.tile.block_prefetch(
                                 prefetch,
