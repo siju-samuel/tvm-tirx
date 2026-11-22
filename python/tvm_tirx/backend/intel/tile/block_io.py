@@ -385,7 +385,7 @@ def _lower_1d(view, sctx, direction, match):
     require(start * (bits // 8) % ALIGNMENT_1D == 0, f"start must be {ALIGNMENT_1D}-byte aligned")
 
     layout_analyzer = Analyzer()
-    fragment = Fragment("registers", registers, n, analyzer, layout_analyzer)
+    fragment = Fragment("registers", registers, n, analyzer, layout_analyzer, resolve)
     fragment.require_bits(bits, "elements")
     if fragment.repeats != (1, runs):
         raise ValueError(
@@ -432,7 +432,7 @@ def _lower(view, sctx, direction):
     analyzer, _, resolve = context_analyzer(sctx)
     layout_analyzer = Analyzer()
     surface = _Surface(memory, var, analyzer, resolve)
-    fragment = Fragment("registers", registers, var.words, analyzer, layout_analyzer)
+    fragment = Fragment("registers", registers, var.words, analyzer, layout_analyzer, resolve)
     fragment.require_bits(var.word_bits, "words")
     # One register atom per single-width block, so a view reads the same whether
     # the instruction moves one block or two side by side.

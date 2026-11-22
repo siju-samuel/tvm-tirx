@@ -732,6 +732,34 @@ def test_1d_block_rejects(opencl_source, bits, n, start, match):
         opencl_source(_roundtrip_1d(bits, n, start))
 
 
+def test_one_iteration_loop_index_is_resolved(opencl_source):
+    """A register region indexed by a loop of one iteration, such as a parameterized
+    unroll at its smallest, is in bounds: the loop's variable has one value."""
+    depth = 1
+
+    @I.ir_module
+    class Module:
+        @T.function
+        def main(Src: T.Tensor((2, 512), "uint16"), Dst: T.Tensor((depth * 8, 16), "uint16")):
+            T.func_attr({"tirx.noalias": True})
+            with T.launch_thread("blockIdx.x", 1):
+                with T.launch_thread("threadIdx.x", 16) as lane:
+                    r = T.alloc_local((depth * 8,), "uint16")
+                    for h in T.unroll(depth):
+                        T.intel.tile.block_read(
+                            "intel_sub_group_block_read_us8",
+                            r.view(depth, 1, 8, 16, layout=frag(depth, 1, 8))[
+                                h : h + 1, 0:1, 0:8, 0:16
+                            ],
+                            Src[1, h * 128 : h * 128 + 128],
+                            scope="subgroup",
+                        )
+                    for c in range(depth * 8):
+                        Dst[c, lane] = r[c]
+
+    assert "intel_sub_group_block_read_us8(" in opencl_source(Module)
+
+
 def test_1d_block_needs_the_whole_contiguous_run(opencl_source):
     @I.ir_module
     class Module:

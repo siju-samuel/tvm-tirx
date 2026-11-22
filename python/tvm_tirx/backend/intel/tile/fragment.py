@@ -103,11 +103,14 @@ class Atom:
 class Fragment:
     """One register operand, checked against its atom's work-item mapping."""
 
-    def __init__(self, name, region, atom, analyzer, layout_analyzer):
+    def __init__(self, name, region, atom, analyzer, layout_analyzer, resolve=None):
         if not isinstance(region, TensorRegion):
             raise TypeError(f"{name}: expected a register tensor region")
         atom = atom if isinstance(atom, Atom) else Atom.rows(atom)
         self.name, self.region, self.atom = name, region, atom
+        # context_analyzer's resolver: a variable bound to one value, such as the index of
+        # a one-iteration loop, is only known through it.
+        self.resolve = resolve or (lambda expr: expr)
         self.tensor, self.ty = region.source, region.source.ty
         self.dtype = str(self.ty.dtype.dtype)
         self.analyzer, self.layout_analyzer = analyzer, layout_analyzer
@@ -116,12 +119,6 @@ class Fragment:
         self.layout = self.ty.effective_layout()
         if self.layout is None:
             raise ValueError(f"{name}: operand requires a physical layout")
-        replicas = [it for it in getattr(self.layout, "replica", ()) if str(it.axis) == str(sglid)]
-        if replicas and [int(it.extent) for it in replicas] != [SUB_GROUP_SIZE]:
-            raise ValueError(
-                f"{name}: a replica must cover the whole sub-group, R[{SUB_GROUP_SIZE} : 1 @ sglid]"
-            )
-        self.replicated = bool(replicas)
         self.shape = tuple(int(analyzer.simplify(r.extent)) for r in region.region)
         n = len(atom.shape)
         if len(self.shape) < n + 2 or self.shape[-n:] != atom.shape:
@@ -148,7 +145,7 @@ class Fragment:
             )
 
     def _require(self, condition, message):
-        if not self.analyzer.can_prove(condition):
+        if not self.analyzer.can_prove(self.resolve(condition)):
             raise ValueError(f"{self.name}: {message}: cannot prove {condition}")
 
     def _physical(self, coords):
