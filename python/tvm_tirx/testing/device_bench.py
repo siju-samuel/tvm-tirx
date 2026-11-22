@@ -52,6 +52,7 @@ def bench_interleaved(
     number: int = 20,
     warmup: int = 2,
     timer: str = "host",
+    between: Callable[[], None] | None = None,
 ) -> dict[str, Measurement]:
     """Time launch closures in turn, round after round.
 
@@ -80,6 +81,16 @@ def bench_interleaved(
         time.  The two need not agree: for back-to-back launches of one kernel
         on an Arc Pro B60, the OpenCL sum came out about 10% above the wall
         time.  Compare candidates with one timer, not across timers.
+    between : Callable[[], None], optional
+        A closure launched after every call, such as a small kernel, so that
+        each candidate runs as one operation among others rather than back to
+        back.  Back-to-back launches of one kernel can overlap (their run times
+        add up to more than the wall time, as above), so one launch can hide the
+        last one's tail, which in a model, where other work comes between, it
+        cannot.  Two plans of a paged decode attention 3% apart back to back on
+        an Arc Pro B60 were 28% apart with a one-work-group kernel between.
+        ``between`` is timed alone in each round, the same way, and its time
+        taken off every sample of the round.
 
     Returns
     -------
@@ -92,24 +103,36 @@ def bench_interleaved(
         raise ValueError("rounds and number must be positive and warmup not negative")
     if timer == "device" and device_timer(device) is None:
         raise ValueError(f"{device} has no runtime timer; use timer='host'")
-    samples = {name: [] for name in funcs}
-    for _ in range(rounds):
-        for name, fn in funcs.items():
-            for _ in range(warmup):
+
+    def per_call_us(fn):
+        for _ in range(warmup):
+            fn()
+        device.sync()
+        if timer == "device":
+            clock = device_timer(device)
+            clock.start()
+            for _ in range(number):
+                fn()
+            clock.stop()
+            elapsed = clock.elapsed_ns() * 1e-9
+        else:
+            start = time.perf_counter()
+            for _ in range(number):
                 fn()
             device.sync()
-            if timer == "device":
-                clock = device_timer(device)
-                clock.start()
-                for _ in range(number):
-                    fn()
-                clock.stop()
-                elapsed = clock.elapsed_ns() * 1e-9
-            else:
-                start = time.perf_counter()
-                for _ in range(number):
-                    fn()
-                device.sync()
-                elapsed = time.perf_counter() - start
-            samples[name].append(elapsed / number * 1e6)
+            elapsed = time.perf_counter() - start
+        return elapsed / number * 1e6
+
+    def followed(fn):
+        def call():
+            fn()
+            between()
+
+        return call
+
+    samples = {name: [] for name in funcs}
+    for _ in range(rounds):
+        base = 0.0 if between is None else per_call_us(between)
+        for name, fn in funcs.items():
+            samples[name].append(per_call_us(fn if between is None else followed(fn)) - base)
     return {name: Measurement(tuple(values)) for name, values in samples.items()}

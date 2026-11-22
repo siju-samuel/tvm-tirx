@@ -54,6 +54,34 @@ def test_rounds_run_every_candidate_in_turn():
     assert calls == ["a"] * 3 + ["b"] * 3 + ["a"] * 3 + ["b"] * 3 + ["a"] * 3 + ["b"] * 3
 
 
+def test_between_follows_every_call_and_its_time_is_taken_off(monkeypatch):
+    """A fake clock that each closure advances makes the subtraction exact."""
+    from tvm_tirx.testing import device_bench
+
+    clock = [0.0]
+    calls = []
+    monkeypatch.setattr(device_bench.time, "perf_counter", lambda: clock[0])
+
+    def tick(name, seconds):
+        def fn():
+            calls.append(name)
+            clock[0] += seconds
+
+        return fn
+
+    results = bench_interleaved(
+        {"a": tick("a", 3e-6)},
+        tvm_tirx.cpu(0),
+        rounds=2,
+        number=2,
+        warmup=1,
+        between=tick("x", 1e-6),
+    )
+    # Each round times the separator alone, then a with it after every call.
+    assert calls == (["x"] * 3 + ["a", "x"] * 3) * 2
+    assert results["a"].samples_us == pytest.approx((3.0, 3.0))
+
+
 N = 1 << 20
 
 
