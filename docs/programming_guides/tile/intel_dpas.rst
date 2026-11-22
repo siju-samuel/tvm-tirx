@@ -474,3 +474,41 @@ splitting the prefetch so each tile is fetched once per work-group, gained
 nothing measurable: the shared tiles already hit in cache. oneDNN generates GPU
 instructions directly, while this kernel goes through OpenCL C and the driver's
 compiler, which may be where the remaining difference lies.
+
+Running on PyTorch Tensors
+--------------------------
+
+The ``-opencl`` targets run kernels through the OpenCL runtime, on its own
+buffers. Each Intel tag has a ``-oneapi`` form, such as
+``intel/arc-b60-oneapi``, whose kernels take PyTorch's XPU tensors directly. It
+is the same ``opencl`` target with device type kDLOneAPI, so the generated
+OpenCL C and every check above are unchanged. Only the module that runs the
+kernels differs: it runs them through SYCL on unified shared memory, and on the
+current stream, which ``tvm_ffi.use_torch_stream`` sets to PyTorch's queue:
+
+.. code-block:: python
+
+    import torch
+    import tvm_ffi
+
+    fun = tvm_tirx.compile(Module, target="intel/arc-b60-oneapi")
+    a = torch.randn(2048, 2048, dtype=torch.float16, device="xpu")
+    b = torch.randn(2048, 2048, dtype=torch.float16, device="xpu")
+    c = torch.empty(2048, 2048, dtype=torch.float32, device="xpu")
+    with tvm_ffi.use_torch_stream():
+        fun["main"](a, b, c)  # no copies; ordered with PyTorch's work on its stream
+
+The SYCL runtime is built with ``TVM_TIRX_USE_ONEAPI=ON`` (or the path to
+``icpx``), and at run time uses the SYCL runtime already in the process, so build
+it with an ``icpx`` of the release PyTorch's XPU build ships. On a Level Zero
+device it compiles each kernel to native code with ocloc, as the OpenCL driver
+does, and asks for round-robin thread scheduling, the OpenCL driver's default:
+with Level Zero's default arbitration, a DPAS GEMM ran at 53 TFLOP/s on an Arc
+Pro B60, against 87 round-robin.
+
+On the B60, over 1000 back-to-back calls at ``2048``\ :sup:`3`, the split-K
+GEMM of ``examples/intel_kernels/gemm.py`` runs at 77 TFLOP/s on PyTorch's
+tensors, against 78 for ``torch.matmul`` in the same process and 83 through the
+OpenCL runtime, whose single launch per call the SYCL path's two submissions do
+not match. A few launches after the GPU has idled run at half that, for
+PyTorch's kernels as much as these: measure after a warm-up.

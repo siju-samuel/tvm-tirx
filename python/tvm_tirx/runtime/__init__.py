@@ -27,7 +27,7 @@ from ._tensor import Tensor, tensor, empty
 from .timer import Timer, device_timer
 
 # function exposures
-from ._tensor import cpu, cuda, opencl, vulkan, metal
+from ._tensor import cpu, cuda, opencl, oneapi, vulkan, metal
 from ._tensor import vpi, rocm, ext_dev, hexagon
 from . import _ffi_api
 

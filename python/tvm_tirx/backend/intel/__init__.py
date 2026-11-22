@@ -27,6 +27,7 @@ def register_backend():
     from tvm_tirx.tirx.script.ir_builder import op as builder_op
 
     backend.load("opencl")
+    backend.load("oneapi")
     import_module(f"{__name__}.target_tags")
     # The script namespace first, so registering the instructions publishes into it; and
     # after opencl, which owns the sub-group scope and layout axis they use.

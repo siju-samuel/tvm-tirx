@@ -76,6 +76,7 @@ tvm_tirx_option(TVM_TIRX_USE_CUDA STRING AUTO "Build with CUDA (OFF, ON, AUTO, o
 tvm_tirx_option(TVM_TIRX_USE_OPENCL STRING OFF "Build with OpenCL (OFF, ON, or SDK path)")
 tvm_tirx_option(TVM_TIRX_USE_OPENCL_ENABLE_HOST_PTR BOOL OFF "Enable OpenCL memory object access to host")
 tvm_tirx_option(TVM_TIRX_USE_OPENCL_EXTN_QCOM BOOL OFF "Enable Qualcomm OpenCL extensions")
+tvm_tirx_option(TVM_TIRX_USE_ONEAPI STRING OFF "Build the oneAPI (SYCL) runtime (OFF, ON, or the path to icpx)")
 
 # Vulkan
 tvm_tirx_option(TVM_TIRX_USE_VULKAN STRING OFF "Build with Vulkan (OFF, ON, or SDK path)")
@@ -238,6 +239,7 @@ include(cmake/modules/OpenMP.cmake)
 # contributions are collected before the compiler object target is created.
 include(cmake/modules/CUDA.cmake)
 include(cmake/modules/OpenCL.cmake)
+include(cmake/modules/OneAPI.cmake)
 include(cmake/modules/Vulkan.cmake)
 include(cmake/modules/Metal.cmake)
 include(cmake/modules/ROCM.cmake)

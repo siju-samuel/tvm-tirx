@@ -969,6 +969,12 @@ ffi::Module BuildOpenCL(IRModule mod, Target target) {
   std::string code_str = code.str();
   ffi::Map<ffi::String, ffi::String> source;
   source.Set("cl", code_str);
+  // A target whose device type is kDLOneAPI runs the same OpenCL C through SYCL instead, on
+  // USM pointers and SYCL queues such as PyTorch's.
+  if (target->GetTargetDeviceType() == kDLOneAPI) {
+    return target::OneAPIModuleCreateWithFallback(ffi::Bytes(code_str), ffi::String("cl"),
+                                                  ExtractFuncInfo(mod), std::move(source));
+  }
   return target::OpenCLModuleCreateWithFallback(ffi::Bytes(code_str), ffi::String("cl"),
                                                 ExtractFuncInfo(mod), std::move(source));
 }

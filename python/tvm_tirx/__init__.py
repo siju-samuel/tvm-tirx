@@ -44,7 +44,7 @@ if TYPE_CHECKING or not _is_config_mode():
     from .base import _RUNTIME_ONLY
 
     # tvm.runtime
-    from .runtime._tensor import cpu, cuda, opencl, vulkan, metal
+    from .runtime._tensor import cpu, cuda, opencl, oneapi, vulkan, metal
     from .runtime._tensor import vpi, rocm, ext_dev
     from .runtime import DataTypeCode
 

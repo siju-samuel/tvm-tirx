@@ -62,20 +62,36 @@ _XE_SUB_GROUP_SIZE = 16
 _XE_BUILD_OPTIONS = "-cl-intel-enable-auto-large-GRF-mode"
 
 
+# kDLOneAPI: SYCL devices, which PyTorch's XPU tensors are on.  See tvm_tirx.backend.oneapi.
+_ONEAPI_DEVICE_TYPE = 14
+
+
 def _register_intel_opencl_tag(name: str, *, max_threads: int, shared_mem: int) -> None:
+    """Register ``name``, and its ``-oneapi`` form: the same part reached through SYCL."""
+    config = {
+        "kind": "opencl",
+        "device": "intel_xe",
+        "keys": ["intel", "opencl", "gpu"],
+        "max_threads_per_block": max_threads,
+        "max_num_threads": max_threads,
+        "max_shared_memory_per_block": shared_mem,
+        "thread_warp_size": _XE_SUB_GROUP_SIZE,
+        "build_options": _XE_BUILD_OPTIONS,
+    }
+    register_tag(name, config)
     register_tag(
-        name,
+        _oneapi_tag(name),
         {
-            "kind": "opencl",
-            "device": "intel_xe",
-            "keys": ["intel", "opencl", "gpu"],
-            "max_threads_per_block": max_threads,
-            "max_num_threads": max_threads,
-            "max_shared_memory_per_block": shared_mem,
-            "thread_warp_size": _XE_SUB_GROUP_SIZE,
-            "build_options": _XE_BUILD_OPTIONS,
+            **config,
+            "keys": ["intel", "oneapi", "opencl", "gpu"],
+            "target_device_type": _ONEAPI_DEVICE_TYPE,
         },
     )
+
+
+def _oneapi_tag(tag):
+    """The tag of the same part as a kDLOneAPI device."""
+    return tag.removesuffix("-opencl") + "-oneapi"
 
 
 # Conservative baseline for any discrete Xe part: 64 KiB of shared local memory
@@ -141,10 +157,13 @@ def device_tag(index=0):
 def _install_device_detector():
     """Detect a tagged Intel part as its tag, so it gets the sub-group width and limits.
 
+    A part reached through SYCL, as a kDLOneAPI device, is detected as the tag's
+    ``-oneapi`` form.
+
     The generic OpenCL detector builds a target from what the device reports, which
     leaves ``thread_warp_size`` at 1 and so keeps the sub-group lowering off.  Any
     other device still goes to that detector, which exists by now: the Intel
-    backend loads the opencl backend before it imports this module.
+    backend loads the opencl and oneapi backends before it imports this module.
     """
     from tvm_tirx.target import Target  # pylint: disable=import-outside-toplevel
     from tvm_tirx.target.detect_target import (  # pylint: disable=import-outside-toplevel
@@ -152,17 +171,21 @@ def _install_device_detector():
         register_device_target_detector,
     )
 
-    generic = SUPPORTED_DEVICE.get("opencl")
+    def wrap(device_type, tag_of):
+        generic = SUPPORTED_DEVICE.get(device_type)
 
-    def detect(dev):
-        tag = tag_for_device_name(dev.device_name)
-        if tag is not None:
-            return Target(tag)
-        if generic is None:
-            raise ValueError(f"No target detector for OpenCL device {dev.device_name!r}")
-        return generic(dev)
+        def detect(dev):
+            tag = tag_for_device_name(dev.device_name)
+            if tag is not None:
+                return Target(tag_of(tag))
+            if generic is None:
+                raise ValueError(f"No target detector for {device_type} device {dev.device_name!r}")
+            return generic(dev)
 
-    register_device_target_detector("opencl", detect)
+        register_device_target_detector(device_type, detect)
+
+    wrap("opencl", lambda tag: tag)
+    wrap("oneapi", _oneapi_tag)
 
 
 _install_device_detector()

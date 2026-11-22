@@ -92,6 +92,8 @@ Namespaces
      - Adreno backend registration.
    * - :doc:`tvm_tirx.backend.intel <backend.intel>`
      - Intel Xe backend: target tags and matrix tile instructions.
+   * - :doc:`tvm_tirx.backend.oneapi <backend.oneapi>`
+     - SYCL runtime for kDLOneAPI devices, such as PyTorch's XPU tensors.
    * - :doc:`tvm_tirx.backend.hexagon <backend.hexagon>`
      - Hexagon backend and linker integration.
    * - :doc:`tvm_tirx.backend.vulkan <backend.vulkan>`
@@ -146,6 +148,7 @@ Namespaces
    tvm_tirx.backend.opencl <backend.opencl>
    tvm_tirx.backend.adreno <backend.adreno>
    tvm_tirx.backend.intel <backend.intel>
+   tvm_tirx.backend.oneapi <backend.oneapi>
    tvm_tirx.backend.hexagon <backend.hexagon>
    tvm_tirx.backend.vulkan <backend.vulkan>
    tvm_tirx.backend.webgpu <backend.webgpu>

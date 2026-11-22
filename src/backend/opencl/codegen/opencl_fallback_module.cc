@@ -42,24 +42,27 @@ class OpenCLFallbackModuleObj : public ffi::ModuleObj {
  public:
   OpenCLFallbackModuleObj(ffi::Bytes code, ffi::String fmt,
                           ffi::Map<ffi::String, runtime::FunctionInfo> fmap,
-                          ffi::Map<ffi::String, ffi::String> source)
+                          ffi::Map<ffi::String, ffi::String> source, std::string kind)
       : code_(std::move(code)),
         fmt_(std::move(fmt)),
         fmap_(std::move(fmap)),
-        source_(std::move(source)) {}
+        source_(std::move(source)),
+        kind_(std::move(kind)) {}
 
-  // Mirror the real module's kind ("opencl") so consumers cannot
-  // distinguish at the kind/api layer.  Saved bytes load back as a real
-  // OpenCLModuleObj on a USE_OPENCL=ON receiver.
-  const char* kind() const final { return "opencl"; }
+  // Mirror the real module's kind ("opencl", or "oneapi" for OpenCL C run through SYCL) so
+  // consumers cannot distinguish at the kind/api layer.  Saved bytes load back as the real
+  // module on a receiver that has that runtime.
+  const char* kind() const final { return kind_.c_str(); }
 
   int GetPropertyMask() const final { return ffi::Module::kBinarySerializable; }
 
   ffi::Optional<ffi::Function> GetFunction(const ffi::String& name) final {
-    TVM_FFI_THROW(RuntimeError)
-        << "OpenCL runtime is not linked into this build; cannot launch kernels. "
-        << "Re-link with USE_OPENCL=ON or load this module in an OpenCL-equipped "
-        << "environment via tvm.runtime.load_module.";
+    TVM_FFI_THROW(RuntimeError) << "The " << kind_
+                                << " runtime is not linked into this build; cannot launch kernels. "
+                                << "Build with TVM_TIRX_USE_"
+                                << (kind_ == "oneapi" ? "ONEAPI" : "OPENCL")
+                                << "=ON or load this module where that runtime is available, via "
+                                << "tvm.runtime.load_module.";
     TVM_FFI_UNREACHABLE();
   }
 
@@ -113,13 +116,16 @@ class OpenCLFallbackModuleObj : public ffi::ModuleObj {
   ffi::Map<ffi::String, runtime::FunctionInfo> fmap_;
   // In-memory source map for InspectSource — never serialized.
   ffi::Map<ffi::String, ffi::String> source_;
+  // The kind of module this stands in for.
+  std::string kind_;
 };
 
 ffi::Module OpenCLFallbackModuleCreate(ffi::Bytes code, ffi::String fmt,
                                        ffi::Map<ffi::String, runtime::FunctionInfo> fmap,
-                                       ffi::Map<ffi::String, ffi::String> source) {
+                                       ffi::Map<ffi::String, ffi::String> source,
+                                       const std::string& kind) {
   auto n = ffi::make_object<OpenCLFallbackModuleObj>(std::move(code), std::move(fmt),
-                                                     std::move(fmap), std::move(source));
+                                                     std::move(fmap), std::move(source), kind);
   return ffi::Module(n);
 }
 

@@ -47,6 +47,7 @@ Functions
    cpu
    cuda
    opencl
+   oneapi
    vulkan
    metal
    vpi

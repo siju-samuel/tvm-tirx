@@ -30,6 +30,7 @@ _BUILTIN_BACKENDS = (
     "rocm",
     "trn",
     "opencl",
+    "oneapi",
     "vulkan",
     "webgpu",
     "hexagon",

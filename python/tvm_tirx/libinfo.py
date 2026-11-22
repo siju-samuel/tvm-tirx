@@ -108,6 +108,7 @@ _COMPONENTS = {
     "cuda": "tvm_runtime_cuda",
     "metal": "tvm_runtime_metal",
     "opencl": "tvm_runtime_opencl",
+    "oneapi": "tvm_runtime_oneapi",
     "vulkan": "tvm_runtime_vulkan",
     "rocm": "tvm_runtime_rocm",
 }

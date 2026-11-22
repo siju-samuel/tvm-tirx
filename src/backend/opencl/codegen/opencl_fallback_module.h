@@ -37,6 +37,7 @@
 #include <tvm/ffi/function.h>
 #include <tvm/support/env.h>
 
+#include <string>
 #include <utility>
 
 #include "../../../runtime/metadata.h"
@@ -51,7 +52,8 @@ namespace target {
  */
 ffi::Module OpenCLFallbackModuleCreate(ffi::Bytes code, ffi::String fmt,
                                        ffi::Map<ffi::String, runtime::FunctionInfo> fmap,
-                                       ffi::Map<ffi::String, ffi::String> source);
+                                       ffi::Map<ffi::String, ffi::String> source,
+                                       const std::string& kind = "opencl");
 
 /*!
  * \brief Codegen-time OpenCL module factory.  Tries the FFI-registered
@@ -80,6 +82,24 @@ inline ffi::Module OpenCLModuleCreateWithFallback(ffi::Bytes code, ffi::String f
   }
   return OpenCLFallbackModuleCreate(std::move(code), std::move(fmt), std::move(fmap),
                                     std::move(source));
+}
+
+/*!
+ * \brief Create a module that runs OpenCL C through SYCL on kDLOneAPI devices.
+ *
+ * The real module comes from "ffi.Module.create.oneapi", registered by the oneAPI runtime
+ * sidecar; without it, a fallback of kind "oneapi" keeps the source for export.
+ */
+inline ffi::Module OneAPIModuleCreateWithFallback(ffi::Bytes code, ffi::String fmt,
+                                                  ffi::Map<ffi::String, runtime::FunctionInfo> fmap,
+                                                  ffi::Map<ffi::String, ffi::String> source) {
+  if (!tvm::support::GetEnv<bool>("TVM_TIRX_COMPILE_FORCE_FALLBACK", false)) {
+    if (auto fcreate = ffi::Function::GetGlobal("ffi.Module.create.oneapi")) {
+      return (*fcreate)(code, fmt, fmap, source).cast<ffi::Module>();
+    }
+  }
+  return OpenCLFallbackModuleCreate(std::move(code), std::move(fmt), std::move(fmap),
+                                    std::move(source), "oneapi");
 }
 
 }  // namespace target

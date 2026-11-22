@@ -394,6 +394,23 @@ def opencl(dev_id=0):
     return tvm_ffi.device(DLDeviceType.kDLOpenCL, dev_id)
 
 
+def oneapi(dev_id=0):
+    """Construct a oneAPI (SYCL) device, the kind PyTorch's XPU tensors are on
+
+    Parameters
+    ----------
+    dev_id : int, optional
+        The device's index in SYCL's global device list, the index PyTorch reports
+        for an XPU tensor through DLPack
+
+    Returns
+    -------
+    dev : Device
+        The created device
+    """
+    return tvm_ffi.device(DLDeviceType.kDLOneAPI, dev_id)
+
+
 def metal(dev_id=0):
     """Construct a metal device
 

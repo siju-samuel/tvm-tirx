@@ -127,6 +127,12 @@ run them with:
 ./tests/scripts/task_python_unittest_intel_gpu.sh
 ```
 
+To run Intel kernels on PyTorch's XPU tensors, also build the SYCL runtime with
+`-DTVM_TIRX_USE_ONEAPI=ON` (or the path to `icpx`), using an `icpx` of the same
+release as PyTorch's SYCL runtime. Its tests, `tests/python/backend/oneapi`, skip
+unless the process has PyTorch with XPU devices, which the default environment
+does not.
+
 Start with the tests for the changed component. Device and architecture skips
 describe missing coverage; they do not demonstrate that a backend works.
 
