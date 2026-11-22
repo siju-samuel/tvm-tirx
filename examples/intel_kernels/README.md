@@ -37,6 +37,7 @@ python examples/intel_kernels/gemm.py --bench "2048^3"
 | [`gemm.py`](gemm.py) | fp16 GEMM with float32 accumulation on DPAS; the leftover tiles of a partly full last wave are split along K |
 | [`attention.py`](attention.py) | FlashAttention prefill, head dimension 64, causal or not, with online softmax in registers |
 | [`moe_gemm.py`](moe_gemm.py) | MoE grouped GEMM over tokens sorted by expert, with the row counts on the device; expert boundaries are masked by the block instructions' surface height |
+| [`w4a16_gemm.py`](w4a16_gemm.py) | Weight-only int4 GEMM for decoding: weights tiled for 1D block reads and dequantized two at a time into DPAS's VNNI words, K split across work-groups |
 | [`rmsnorm.py`](rmsnorm.py) | RMSNorm in float16 with 1D sub-group block reads and writes; a row is read once, by four sub-groups that meet in shared local memory |
 
 `tests/python/backend/intel/test_intel_kernels.py` runs the modules' correctness

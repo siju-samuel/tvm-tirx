@@ -147,5 +147,38 @@ def test_moe_grouped_gemm(tile):
     tvm_tirx.testing.run_with_gpu_lock(run_and_check)
 
 
+def test_w4a16_packing_round_trips():
+    """The tiled layout holds the same words, and dequantizing undoes quantizing."""
+    w4 = _load("w4a16_gemm")
+    rng = np.random.default_rng(0)
+    w = rng.standard_normal((32, 256)).astype(np.float32)
+    packed, scale = w4.quantize(w)
+    tiled, scales = w4.pack(packed, scale)
+    assert tiled.shape == (2, 4, 128) and scales.shape == (2, 32)
+    # Word j of column i in step s of column block b is words[16 b + i, 8 s + j].
+    assert tiled[1, 2, 16 * 5 + 3] == packed[16 * 1 + 3, 8 * 2 + 5]
+    back = w4.dequantize(packed, scale)
+    assert np.abs(back - w).max() <= np.repeat(scale, w4.GROUP, axis=1).max() / 2 + 1e-6
+
+
+@pytest.mark.gpu
+@requires_intel_gpu
+@pytest.mark.parametrize("splits", [1, 2])
+@pytest.mark.parametrize("m", [1, 13, 32])
+def test_w4a16_gemm(m, splits):
+    w4 = _load("w4a16_gemm")
+    cfg = {"m": m, "n": 256, "k": 512}
+    data = w4.prepare_data(**cfg, splits=splits)
+    fun = tvm_tirx.compile(w4.get_kernel(**cfg, splits=splits), target=TARGET)
+
+    def run_and_check():
+        dev = tvm_tirx.opencl(0)
+        tensors = [tvm_tirx.runtime.tensor(data[k], dev) for k in ("X", "Wt", "Sc", "Y", "P")]
+        fun["main"](*tensors)
+        w4.check_correctness(dict(data, Y=tensors[3].numpy()), **cfg)
+
+    tvm_tirx.testing.run_with_gpu_lock(run_and_check)
+
+
 if __name__ == "__main__":
     tvm_tirx.testing.main()
