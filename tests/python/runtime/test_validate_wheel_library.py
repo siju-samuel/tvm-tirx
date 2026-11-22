@@ -59,6 +59,21 @@ def test_cuda_runtime_present():
     assert present, "CUDA runtime expected but not bundled in tvm/lib"
 
 
+def test_opencl_runtime_present():
+    """A wheel built with OpenCL bundles its runtime, which loads without an OpenCL driver.
+
+    The runtime finds the vendor's OpenCL library only when a device is first used, so
+    importing TIRx and compiling an OpenCL kernel work on a machine without one."""
+    if os.environ.get("TVM_WHEEL_EXPECT_OPENCL_RUNTIME") != "1":
+        pytest.skip("OpenCL runtime not expected in this wheel")
+    libdir = Path(tvm_tirx.__file__).resolve().parent / "lib"
+    present = glob.glob(str(libdir / "libtvm_runtime_opencl.*")) or glob.glob(
+        str(libdir / "tvm_runtime_opencl.*")
+    )
+    assert present, "OpenCL runtime expected but not bundled in tvm/lib"
+    assert tvm_tirx.runtime.enabled("opencl"), "the bundled OpenCL runtime did not load"
+
+
 def test_cpu_aot(tmp_path):
     if sys.platform not in ("linux", "darwin") or not tvm_tirx.runtime.enabled("llvm"):
         pytest.skip("CPU AOT requires Linux/macOS and LLVM")

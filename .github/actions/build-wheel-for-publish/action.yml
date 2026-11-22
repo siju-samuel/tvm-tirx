@@ -98,10 +98,12 @@ runs:
         # tests/python/runtime/test_validate_wheel_library.py
         # ON (they skip unless these are set). Every published wheel is LLVM-enabled,
         # so TVM_WHEEL_EXPECT_LLVM is always "1"; the CUDA runtime is only bundled on
-        # the CUDA wheels, so TVM_WHEEL_EXPECT_CUDA_RUNTIME is "0" for CPU wheels.
+        # the CUDA wheels, so TVM_WHEEL_EXPECT_CUDA_RUNTIME is "0" for CPU wheels; and
+        # the OpenCL runtime is expected wherever the defines enable it.
         CIBW_TEST_ENVIRONMENT: >-
           TVM_WHEEL_EXPECT_LLVM="1"
           TVM_WHEEL_EXPECT_CUDA_RUNTIME="${{ inputs.include_cuda_runtime }}"
+          TVM_WHEEL_EXPECT_OPENCL_RUNTIME="${{ contains(inputs.cmake_defines, 'TVM_TIRX_USE_OPENCL=ON') && '1' || '0' }}"
 
     - name: Build and test LLVM targets wheel
       uses: pypa/cibuildwheel@b3395e271a35f73dad77f21802abe9b986dfe299  # v4.3.1

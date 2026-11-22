@@ -148,12 +148,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: "Linux x86_64 wheel with CUDA runtime (manylinux_2_28)"
+          - name: "Linux x86_64 wheel with CUDA and OpenCL runtimes (manylinux_2_28)"
             os: ubuntu-latest
             arch: x86_64
             build: cp310-manylinux_x86_64
             include_cuda_runtime: "1"
             artifact_suffix: linux-x86_64-manylinux_2_28
+            # The OpenCL runtime finds the vendor's OpenCL library at run time, so the wheel
+            # gains no link dependency; this is how pip users reach Intel GPUs.
+            cmake_defines: "-DTVM_TIRX_USE_OPENCL=ON"
           - name: "Linux aarch64 wheel with CUDA runtime (manylinux_2_28)"
             os: ubuntu-24.04-arm
             arch: aarch64
