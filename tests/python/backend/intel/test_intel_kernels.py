@@ -125,5 +125,27 @@ def test_rmsnorm(single_pass):
     tvm_tirx.testing.run_with_gpu_lock(run_and_check)
 
 
+@pytest.mark.gpu
+@requires_intel_gpu
+@pytest.mark.parametrize("tile", [(32, 1), (64, 1), (64, 4)], ids=["32x1", "64x1", "64x4"])
+def test_moe_grouped_gemm(tile):
+    """Uneven experts, some with no tokens: rows stay within their expert in hardware."""
+    moe = _load("moe_gemm")
+    cfg = {"experts": 8, "tokens": 700, "n": 256, "k": 128}
+    data = moe.prepare_data(**cfg, counts=[0, 300, 0, 1, 95, 0, 200, 104])
+    rows, sub_groups = tile
+    fun = tvm_tirx.compile(
+        moe.get_kernel(**cfg, tile_rows=rows, sub_groups_m=sub_groups), target=TARGET
+    )
+
+    def run_and_check():
+        dev = tvm_tirx.opencl(0)
+        tensors = [tvm_tirx.runtime.tensor(data[k], dev) for k in ("X", "Ww", "offsets", "Y")]
+        fun["main"](*tensors)
+        moe.check_correctness(dict(data, Y=tensors[3].numpy()), **cfg)
+
+    tvm_tirx.testing.run_with_gpu_lock(run_and_check)
+
+
 if __name__ == "__main__":
     tvm_tirx.testing.main()
