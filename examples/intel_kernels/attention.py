@@ -30,7 +30,10 @@ registers, so the score matrix is never stored.  For each block of keys:
   an A operand, and O += P V with V read by the transforming block read.
 
 At the end each row is divided by its sum.  With ``causal``, keys after the
-query are masked, and blocks wholly after it are skipped.
+query are masked, and blocks wholly after it are skipped.  The exponentials are
+``exp2`` of arguments scaled by log2(e) as well as the softmax scale: IGC
+compiles ``exp`` to a dozen instructions, ``exp2`` to one, and the change
+doubled the kernel's speed.
 
 The module follows TIRx-kernels' kernel protocol.
 """
@@ -63,6 +66,7 @@ ROWS = 16  # query rows per sub-group: two 8-row DPAS fragments
 SUB_GROUPS = 8  # sub-groups per work-group
 F16 = "intel_sub_group_f16_f16_matrix_mad_k16"
 NEG = -1.0e30  # a masked score; exp(NEG - max) is 0
+LOG2E = 1.4426950408889634
 
 
 def _lay(shape, strides):
@@ -75,8 +79,11 @@ def _rows_layout(shape, strides):
 
 
 @T.function(private=True)
-def _exp_scaled(s: T.float32, m: T.float32, scale: T.float32) -> T.float32:
-    return T.exp((s - m) * scale)
+def _exp_scaled(s: T.float32, m: T.float32, c: T.float32) -> T.float32:
+    # exp((s - m) * scale) as exp2 with c = scale * log2(e): the math unit's 2^x, where IGC's
+    # exp takes a dozen instructions and two 2^x.  Subtracting first keeps a masked score
+    # minus a masked maximum at 0, which s * c - m * c, fused into a multiply-add, does not.
+    return T.exp2((s - m) * c)
 
 
 @T.function(private=True)
@@ -255,7 +262,7 @@ def get_kernel(*, backend_config=None, heads, length, head_dim, causal, keys=32,
                                 part.view(2, 1, 8, 1, layout=rows),
                                 m.view(2, 1, 8, 1, layout=rows),
                                 m_new.view(2, 1, 8, 1, layout=rows),
-                                T.float32(scale),
+                                T.float32(scale * LOG2E),
                             )
                             T.intel.tile.ewise(
                                 _times,
@@ -280,7 +287,7 @@ def get_kernel(*, backend_config=None, heads, length, head_dim, causal, keys=32,
                                 s.view(2, NB, 8, 16, layout=s_lay),
                                 s.view(2, NB, 8, 16, layout=s_lay),
                                 m.view(2, NB, 8, 16, layout=rows_as_s),
-                                T.float32(scale),
+                                T.float32(scale * LOG2E),
                             )
                             T.intel.tile.reduce(
                                 "sum",

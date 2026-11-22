@@ -100,6 +100,7 @@ CONFIGS = [
 PAGE = 16  # tokens per page
 F16 = "intel_sub_group_f16_f16_matrix_mad_k16"
 NEG = -1.0e30  # a masked score; exp(NEG - max) is 0
+LOG2E = 1.4426950408889634
 MERGE_THREADS = 256
 
 
@@ -113,8 +114,11 @@ def _rows(shape, strides):
 
 
 @T.function(private=True)
-def _exp_scaled(s: T.float32, m: T.float32, scale: T.float32) -> T.float32:
-    return T.exp((s - m) * scale)
+def _exp_scaled(s: T.float32, m: T.float32, c: T.float32) -> T.float32:
+    # exp((s - m) * scale) as exp2 with c = scale * log2(e), which IGC compiles to the math
+    # unit's 2^x rather than exp's dozen instructions.  Subtracting first keeps an empty
+    # share's maximum minus itself at 0, which s * c - m * c, fused into a multiply-add, does not.
+    return T.exp2((s - m) * c)
 
 
 @T.function(private=True)
@@ -233,7 +237,7 @@ def get_kernel(
     shares = splits * sub_groups
     max_pages = math.ceil(max_len / PAGE)
     rows_total = batch * heads
-    scale = 1.0 / math.sqrt(head_dim)
+    c = LOG2E / math.sqrt(head_dim)  # the softmax scale, for exp2
     pool = T.dynamic("pool", "int32")
     # Q, the keys, the values and O by 16-wide block of the head dimension:
     # register block * 8 + row for Q and O, block * 8 + VNNI word for K and V.
@@ -366,7 +370,7 @@ def get_kernel(
                                     part.view(1, 1, 8, 1, layout=rows),
                                     m.view(1, 1, 8, 1, layout=rows),
                                     m_new.view(1, 1, 8, 1, layout=rows),
-                                    T.float32(scale),
+                                    T.float32(c),
                                 )
                                 T.intel.tile.ewise(
                                     _times,
@@ -391,7 +395,7 @@ def get_kernel(
                                     s.view(1, 1, 8, 16, layout=s_lay),
                                     s.view(1, 1, 8, 16, layout=s_lay),
                                     m.view(1, 1, 8, 16, layout=rows_as_s),
-                                    T.float32(scale),
+                                    T.float32(c),
                                 )
                                 T.intel.tile.reduce(
                                     "sum",
@@ -477,7 +481,7 @@ def get_kernel(
                                         num[0] = T.float32(0)
                                         den[0] = T.float32(0)
                                         for j in range(sub_groups):
-                                            w = T.exp((part_m[j, r] - best[0]) * T.float32(scale))
+                                            w = T.exp2((part_m[j, r] - best[0]) * c)
                                             num[0] = num[0] + part_o[j, r, e % D] * w
                                             den[0] = den[0] + part_t[j, r] * w
                                         if splits == 1:
@@ -505,7 +509,7 @@ def get_kernel(
                             num[0] = T.float32(0)
                             den[0] = T.float32(0)
                             for j in range(splits):
-                                w = T.exp((Ms[j * rows_total + r, 0] - best[0]) * T.float32(scale))
+                                w = T.exp2((Ms[j * rows_total + r, 0] - best[0]) * c)
                                 num[0] = num[0] + Op[j * rows_total + r, e % D] * w
                                 den[0] = den[0] + Ms[j * rows_total + r, 1] * w
                             Out[r, e % D] = num[0] / den[0]
@@ -583,8 +587,9 @@ def prepare_data(
         "table": table,
         "lens": lengths,
         "O": np.zeros((batch * heads, head_dim), np.float32),
-        "Op": np.zeros(op, np.float32),
-        "Ms": np.zeros(ms, np.float32),
+        # NaN, so a merge that read what no share wrote would show.
+        "Op": np.full(op, np.nan, np.float32),
+        "Ms": np.full(ms, np.nan, np.float32),
     }
 
 

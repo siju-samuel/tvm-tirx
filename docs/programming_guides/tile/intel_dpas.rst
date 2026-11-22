@@ -376,6 +376,17 @@ can read on any work-item, so ``m`` broadcasts along the columns through a view
 with stride 0. A reduction whose elements stay on one work-item each, such as
 summing two column blocks, moves no data and keeps the columns where they were.
 
+A softmax should take ``T.exp2`` of its argument times log2(e) rather than
+``T.exp``. IGC compiles OpenCL's ``exp`` to a dozen instructions around two of
+the math unit's ``2^x``, with range checks, and ``exp2`` to the ``2^x`` alone.
+With the softmax scale and log2(e) folded into one constant ``c``,
+``exp2((s - m) * c)`` takes three instructions. Subtract before scaling:
+``exp2(s * c - m * c)`` saves one, but IGC fuses it into a multiply-add whose
+rounding leaves a masked score minus a masked maximum far from 0, so ``exp2``
+of it can be infinite. In the FlashAttention kernel of
+``examples/intel_kernels/attention.py`` the change took a B60 from 24 to 47
+TFLOP/s, against 41 for PyTorch's ``scaled_dot_product_attention``.
+
 Larger Tiles
 ------------
 
