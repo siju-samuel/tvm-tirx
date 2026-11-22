@@ -116,6 +116,36 @@ def test_kernel_runs_on_torch_tensors_in_place():
     torch.testing.assert_close(c, a + 2 * b)
 
 
+def _run_add(torch):
+    fun = tvm_tirx.compile(_add(), target=TARGET)
+    a, b = torch.randn(N, device="xpu"), torch.randn(N, device="xpu")
+    c = torch.zeros(N, device="xpu")
+    fun["main"](a, b, c)
+    torch.xpu.synchronize()
+    torch.testing.assert_close(c, a + 2 * b)
+
+
+@requires_oneapi
+def test_native_binaries_are_cached_on_disk(tmp_path, monkeypatch):
+    """A kernel's ocloc binary is kept, a damaged one is replaced, and an empty
+    TVM_TIRX_CACHE_DIR keeps none."""
+    torch = _torch_xpu()
+    monkeypatch.setenv("TVM_TIRX_CACHE_DIR", str(tmp_path))
+    _run_add(torch)
+    (binary,) = (tmp_path / "oneapi").glob("*.bin")
+    good = binary.read_bytes()
+    assert good.startswith(b"TIRXOCL1")
+    # A new module of the same kernel reads it, and a damaged file is compiled over.
+    binary.write_bytes(good[: len(good) // 2])
+    _run_add(torch)
+    assert binary.read_bytes() == good
+    monkeypatch.setenv("TVM_TIRX_CACHE_DIR", "")
+    for path in (tmp_path / "oneapi").iterdir():
+        path.unlink()
+    _run_add(torch)
+    assert not list((tmp_path / "oneapi").iterdir())
+
+
 @requires_oneapi
 def test_kernel_runs_in_order_on_a_torch_stream():
     """Under use_torch_stream, a TIRx kernel between two torch ops on a side stream sees the

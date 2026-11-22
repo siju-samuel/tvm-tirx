@@ -23,19 +23,26 @@
  *
  * The OpenCL code generator's output, one kernel per "// Function:" section with its compiler
  * options on a "// Build options:" line, is built for a device the first time a kernel runs
- * there: to native code with ocloc on a Level Zero device, otherwise with DPC++'s kernel
- * compiler.  Kernels launch on the current oneAPI stream, which
+ * there: to native code with ocloc on a Level Zero device, kept in an on-disk cache, otherwise
+ * with DPC++'s kernel compiler.  Kernels launch on the current oneAPI stream, which
  * tvm_ffi.use_torch_stream sets to PyTorch's queue, so they take PyTorch's XPU tensors without
  * a copy and run in order with PyTorch's own work.
  */
 #include <dlfcn.h>
 #include <level_zero/ze_api.h>
+#include <sys/stat.h>
 #include <tvm/ffi/extra/module.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/support/bytes_io.h>
+#include <unistd.h>
 
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -106,6 +113,9 @@ class Ocloc {
     return binary;
   }
 
+  /*! \brief The library file ocloc was loaded from, its size and modification time. */
+  const std::string& identity() const { return identity_; }
+
  private:
   using Invoke = int (*)(uint32_t, const char**, uint32_t, const uint8_t**, const uint64_t*,
                          const char**, uint32_t, const uint8_t**, const uint64_t*, const char**,
@@ -117,7 +127,16 @@ class Ocloc {
       if (void* handle = dlopen(lib, RTLD_NOW | RTLD_LOCAL)) {
         invoke_ = reinterpret_cast<Invoke>(dlsym(handle, "oclocInvoke"));
         free_ = reinterpret_cast<Free>(dlsym(handle, "oclocFreeOutput"));
-        if (invoke_ != nullptr && free_ != nullptr) return;
+        if (invoke_ != nullptr && free_ != nullptr) {
+          Dl_info info;
+          struct stat st;
+          if (dladdr(reinterpret_cast<void*>(invoke_), &info) != 0 && info.dli_fname != nullptr &&
+              stat(info.dli_fname, &st) == 0) {
+            identity_ = std::string(info.dli_fname) + ":" + std::to_string(st.st_size) + ":" +
+                        std::to_string(st.st_mtime);
+          }
+          return;
+        }
         invoke_ = nullptr;
       }
     }
@@ -125,6 +144,104 @@ class Ocloc {
 
   Invoke invoke_ = nullptr;
   Free free_ = nullptr;
+  std::string identity_;
+};
+
+/*!
+ * \brief Native binaries ocloc compiled, on disk, so a kernel compiles once per machine rather
+ * than once per process.
+ *
+ * The OpenCL driver keeps such a cache for the programs it builds, and ocloc does not: on an Arc
+ * Pro B60 every process otherwise spent about 0.4 s on each kernel's first launch.  A binary is
+ * keyed by all its compilation depends on: the kernel's source and options, the device's PCI
+ * id, the driver's version and the ocloc library.  Each file holds its whole key, so a hash
+ * collision or a damaged file reads as a miss.  The directory is ``oneapi`` under
+ * ``TVM_TIRX_CACHE_DIR``, by default ``$XDG_CACHE_HOME/tvm_tirx`` or ``~/.cache/tvm_tirx``; an
+ * empty ``TVM_TIRX_CACHE_DIR`` turns the cache off.  Failing to read or write it only costs a
+ * compile.
+ */
+class BinaryCache {
+ public:
+  explicit BinaryCache(std::string key) : key_(std::move(key)) {
+    std::string dir = Directory();
+    if (dir.empty()) return;
+    char name[40];
+    std::snprintf(name, sizeof(name), "%016llx%016llx.bin",
+                  static_cast<unsigned long long>(Fnv1a(key_)),
+                  static_cast<unsigned long long>(std::hash<std::string>()(key_)));
+    dir_ = dir;
+    path_ = dir + "/" + name;
+  }
+
+  bool Load(std::vector<uint8_t>* binary) const {
+    if (path_.empty()) return false;
+    std::ifstream in(path_, std::ios::binary);
+    char magic[sizeof(kMagic)];
+    uint64_t key_size = 0, size = 0;
+    if (!in.read(magic, sizeof(magic)) || std::string(magic, sizeof(magic)) != kMagic ||
+        !in.read(reinterpret_cast<char*>(&key_size), sizeof(key_size)) || key_size != key_.size()) {
+      return false;
+    }
+    std::string key(key_size, '\0');
+    if (!in.read(key.data(), key_size) || key != key_ ||
+        !in.read(reinterpret_cast<char*>(&size), sizeof(size)) || size == 0) {
+      return false;
+    }
+    binary->resize(size);
+    return static_cast<bool>(in.read(reinterpret_cast<char*>(binary->data()), size));
+  }
+
+  void Store(const std::vector<uint8_t>& binary) const {
+    if (path_.empty()) return;
+    std::error_code ec;
+    std::filesystem::create_directories(dir_, ec);
+    // Written aside and renamed into place, so a reader never sees half a file.
+    std::string tmp = path_ + "." + std::to_string(getpid()) + ".tmp";
+    {
+      std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+      uint64_t key_size = key_.size(), size = binary.size();
+      out.write(kMagic, sizeof(kMagic));
+      out.write(reinterpret_cast<const char*>(&key_size), sizeof(key_size));
+      out.write(key_.data(), key_size);
+      out.write(reinterpret_cast<const char*>(&size), sizeof(size));
+      out.write(reinterpret_cast<const char*>(binary.data()), size);
+      if (!out) {
+        out.close();
+        std::filesystem::remove(tmp, ec);
+        return;
+      }
+    }
+    std::filesystem::rename(tmp, path_, ec);
+    if (ec) std::filesystem::remove(tmp, ec);
+  }
+
+ private:
+  static constexpr char kMagic[8] = {'T', 'I', 'R', 'X', 'O', 'C', 'L', '1'};
+
+  static std::string Directory() {
+    std::string base;
+    if (const char* dir = std::getenv("TVM_TIRX_CACHE_DIR")) {
+      if (*dir == '\0') return "";
+      base = dir;
+    } else if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg != nullptr && *xdg != '\0') {
+      base = std::string(xdg) + "/tvm_tirx";
+    } else if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
+      base = std::string(home) + "/.cache/tvm_tirx";
+    } else {
+      return "";
+    }
+    return base + "/oneapi";
+  }
+
+  static uint64_t Fnv1a(const std::string& text) {
+    uint64_t hash = 14695981039346656037ULL;
+    for (unsigned char c : text) hash = (hash ^ c) * 1099511628211ULL;
+    return hash;
+  }
+
+  std::string key_;
+  std::string dir_;
+  std::string path_;
 };
 
 /*! \brief ``name`` from a native binary, as a SYCL kernel of ``context`` on a Level Zero device. */
@@ -219,8 +336,16 @@ class OneAPIModuleObj : public ffi::ModuleObj {
     if (ocloc != nullptr && device.get_backend() == sycl::backend::ext_oneapi_level_zero &&
         device.has(sycl::aspect::ext_intel_device_id)) {
       uint32_t device_id = device.get_info<sycl::ext::intel::info::device::device_id>();
-      sycl::kernel kernel = LoadNativeKernel(
-          context, device, ocloc->Compile(src->second, option_line, device_id), name);
+      BinaryCache cache("device=" + std::to_string(device_id) +
+                        "\ndriver=" + device.get_info<sycl::info::device::driver_version>() +
+                        "\nocloc=" + ocloc->identity() + "\noptions=" + option_line +
+                        "\nsource=" + src->second);
+      std::vector<uint8_t> binary;
+      if (!cache.Load(&binary)) {
+        binary = ocloc->Compile(src->second, option_line, device_id);
+        cache.Store(binary);
+      }
+      sycl::kernel kernel = LoadNativeKernel(context, device, binary, name);
       kernels_.emplace(key, kernel);
       return kernel;
     }

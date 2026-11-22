@@ -517,6 +517,15 @@ does, and asks for round-robin thread scheduling, the OpenCL driver's default:
 with Level Zero's default arbitration, a DPAS GEMM ran at 53 TFLOP/s on an Arc
 Pro B60, against 87 round-robin.
 
+The OpenCL driver keeps the programs it builds in an on-disk cache, and ocloc
+does not, so the SYCL runtime keeps its own: each native binary, under
+``oneapi`` in ``TVM_TIRX_CACHE_DIR``, by default ``$XDG_CACHE_HOME/tvm_tirx``
+or ``~/.cache/tvm_tirx``. A binary is keyed by the kernel's source and options,
+the device, the driver's version and the ocloc library, so it is rebuilt when
+any of them changes. Without it each process compiled each kernel at its first
+launch, about 0.4 s apiece on the B60; with it a later process loads it in
+0.01 s. An empty ``TVM_TIRX_CACHE_DIR`` turns the cache off.
+
 On the B60, over 1000 back-to-back calls at ``2048``\ :sup:`3`, the split-K
 GEMM of ``examples/intel_kernels/gemm.py`` runs at 77 TFLOP/s on PyTorch's
 tensors, against 78 for ``torch.matmul`` in the same process and 83 through the
