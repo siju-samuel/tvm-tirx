@@ -180,5 +180,55 @@ def test_w4a16_gemm(m, splits):
     tvm_tirx.testing.run_with_gpu_lock(run_and_check)
 
 
+def test_decode_attention_plans_its_shares():
+    dec = _load("decode_attention")
+
+    def plan(batch, max_len, head_dim=128):
+        return dec.plan(batch=batch, kv_heads=8, head_dim=head_dim, max_len=max_len)
+
+    # Short shares stay in one work-group and merge in shared local memory.
+    assert plan(4, 300) == (1, 8)
+    # Long ones go to separate work-groups, 256 shares in all.
+    assert plan(8, 8192) == (4, 1)
+    assert plan(1, 32768) == (32, 1)
+    # Enough sequences and heads need no sharing.
+    assert plan(32, 2048) == (1, 1)
+    # A work-group's shares fit in 64 KiB of shared local memory: 4 of head_dim 512,
+    # so 9 short shares take 3 work-groups.
+    assert plan(2, 300, head_dim=512) == (3, 3)
+
+
+@pytest.mark.gpu
+@requires_intel_gpu
+@pytest.mark.parametrize("plan", [(1, 1), (3, 1), (1, 4), (2, 3)], ids=lambda p: f"{p[0]}x{p[1]}")
+@pytest.mark.parametrize(
+    "heads, kv_heads, head_dim", [(32, 8, 128), (28, 4, 64)], ids=["gqa4 d128", "gqa7 d64"]
+)
+def test_decode_attention(plan, heads, kv_heads, head_dim):
+    """Every way of sharing the pages, including empty shares and rows past the group."""
+    dec = _load("decode_attention")
+    splits, sub_groups = plan
+    cfg = {
+        "batch": 4,
+        "heads": heads,
+        "kv_heads": kv_heads,
+        "head_dim": head_dim,
+        "max_len": 200,
+        "splits": splits,
+        "sub_groups": sub_groups,
+    }
+    # A full sequence, one token, one whole page and a ragged one.
+    data = dec.prepare_data(**cfg, lengths=[200, 1, 16, 77])
+    fun = tvm_tirx.compile(dec.get_kernel(**cfg), target=TARGET)
+
+    def run_and_check():
+        dev = tvm_tirx.opencl(0)
+        tensors = [tvm_tirx.runtime.tensor(data[k], dev) for k in dec.ARGS]
+        fun["main"](*tensors)
+        dec.check_correctness(dict(data, O=tensors[5].numpy()), **cfg)
+
+    tvm_tirx.testing.run_with_gpu_lock(run_and_check)
+
+
 if __name__ == "__main__":
     tvm_tirx.testing.main()
