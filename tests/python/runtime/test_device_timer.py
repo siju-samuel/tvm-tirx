@@ -26,7 +26,7 @@ from tvm_tirx.script import ir as I
 from tvm_tirx.script import tirx as T
 from tvm_tirx.target import Target
 from tvm_tirx.testing import env
-from tvm_tirx.testing.device_bench import bench_interleaved
+from tvm_tirx.testing.device_bench import bench_interleaved, separator
 
 
 def test_cpu_has_no_device_timer():
@@ -131,6 +131,22 @@ def test_opencl_timer_measures_the_kernels():
         ratio = device["busy"].median_us / host["busy"].median_us
         assert 0.5 < ratio < 2, ratio
         np.testing.assert_allclose(args[1].numpy(), args[1].numpy()[0], rtol=1e-6)
+
+    tvm_tirx.testing.run_with_gpu_lock(run_and_check)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not env.has_opencl(), reason="need opencl")
+def test_separator_runs_between_calls():
+    def run_and_check():
+        dev = tvm_tirx.opencl(0)
+        launch = separator(dev)
+        results = bench_interleaved(
+            {"noop": lambda: None}, dev, rounds=2, number=3, warmup=1, between=launch
+        )
+        # Two rounds, each timing the separator alone and then after every call.
+        np.testing.assert_array_equal(launch.buffer.numpy(), 2 * 2 * (1 + 3))
+        assert len(results["noop"].samples_us) == 2
 
     tvm_tirx.testing.run_with_gpu_lock(run_and_check)
 

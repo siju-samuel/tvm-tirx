@@ -373,17 +373,21 @@ def main(argv=None):
     from tvm_tirx.backend.intel.target_tags import (
         device_tag,  # pylint: disable=import-outside-toplevel
     )
-    from tvm_tirx.testing.device_bench import (
-        bench_interleaved,  # pylint: disable=import-outside-toplevel
+    from tvm_tirx.testing.device_bench import (  # pylint: disable=import-outside-toplevel
+        bench_interleaved,
+        separator,
     )
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("labels", nargs="*", help="config labels; all by default")
-    parser.add_argument("--bench", action="store_true", help="time each config")
+    parser.add_argument(
+        "--bench", action="store_true", help="time each config, a small kernel after each call"
+    )
     parser.add_argument("--device", type=int, default=0, help="OpenCL device index")
     args = parser.parse_args(argv)
     dev = tvm_tirx.opencl(args.device)
     target = device_tag(args.device) or KERNEL_META["runtime_targets"][0]
+    between = separator(dev, target)
     for cfg in CONFIGS:
         if args.labels and cfg["label"] not in args.labels:
             continue
@@ -395,7 +399,9 @@ def main(argv=None):
         check_correctness(dict(data, O=tensors[3].numpy()), **cfg)
         line = f"{cfg['label']:24s} correct"
         if args.bench:
-            result = bench_interleaved({"tirx": lambda: fun["main"](*tensors)}, dev)
+            result = bench_interleaved(
+                {"tirx": lambda: fun["main"](*tensors)}, dev, number=50, between=between
+            )
             line += f"  {flops(**cfg) / result['tirx'].median_us / 1e6:.1f} TFLOP/s"
         print(line, flush=True)
 

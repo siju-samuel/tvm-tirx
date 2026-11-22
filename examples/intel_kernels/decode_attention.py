@@ -634,22 +634,6 @@ def bytes_moved(*, batch, heads, kv_heads, head_dim, max_len, **_):
 ARGS = ("Q", "Kw", "V", "table", "lens", "O", "Op", "Ms")
 
 
-def _separator(target):
-    """A one-work-group kernel to launch between timed calls, as other work would be."""
-
-    @I.ir_module
-    class Separator:
-        @T.function
-        def main(A: T.Tensor((256,), "float32")):
-            with T.launch_thread("blockIdx.x", 1) as _:
-                with T.launch_thread("threadIdx.x", 256) as tx:
-                    A[tx] = A[tx] + T.float32(1)
-
-    import tvm_tirx  # pylint: disable=import-outside-toplevel
-
-    return tvm_tirx.compile(Separator, target=target)["main"]
-
-
 def main(argv=None):
     """Check every config, or the named ones, and with ``--bench`` time them."""
     import argparse  # pylint: disable=import-outside-toplevel
@@ -658,8 +642,9 @@ def main(argv=None):
     from tvm_tirx.backend.intel.target_tags import (
         device_tag,  # pylint: disable=import-outside-toplevel
     )
-    from tvm_tirx.testing.device_bench import (
-        bench_interleaved,  # pylint: disable=import-outside-toplevel
+    from tvm_tirx.testing.device_bench import (  # pylint: disable=import-outside-toplevel
+        bench_interleaved,
+        separator,
     )
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -675,8 +660,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     dev = tvm_tirx.opencl(args.device)
     target = device_tag(args.device) or KERNEL_META["runtime_targets"][0]
-    separator = _separator(target)
-    flag = tvm_tirx.runtime.tensor(np.zeros(256, np.float32), dev)
+    between = separator(dev, target)
     for cfg in CONFIGS:
         if args.labels and cfg["label"] not in args.labels:
             continue
@@ -694,7 +678,7 @@ def main(argv=None):
                 {"tirx": lambda: fun["main"](*tensors)},
                 dev,
                 number=200,
-                between=lambda: separator(flag),
+                between=between,
             )
             us = result["tirx"].median_us
             line += f"  {us:7.1f} us  {bytes_moved(**cfg) / us / 1e3:6.1f} GB/s"

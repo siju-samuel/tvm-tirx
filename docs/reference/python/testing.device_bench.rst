@@ -38,3 +38,4 @@ Functions
    :toctree: generated/
 
    bench_interleaved
+   separator

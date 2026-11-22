@@ -31,6 +31,8 @@ from dataclasses import dataclass
 
 from tvm_tirx.runtime import device_timer
 
+_SEPARATOR_SIZE = 256
+
 
 @dataclass(frozen=True)
 class Measurement:
@@ -136,3 +138,48 @@ def bench_interleaved(
         for name, fn in funcs.items():
             samples[name].append(per_call_us(fn if between is None else followed(fn)) - base)
     return {name: Measurement(tuple(values)) for name, values in samples.items()}
+
+
+def separator(device, target=None) -> Callable[[], None]:
+    """A launch of a one-work-group kernel on a GPU, to pass as ``between``.
+
+    Parameters
+    ----------
+    device : tvm_tirx.runtime.Device
+        The GPU.
+    target : str or tvm_tirx.target.Target, optional
+        The target to build the kernel for; by default the one detected for
+        ``device``.
+
+    Returns
+    -------
+    launch : Callable[[], None]
+        A closure that launches the kernel once.  Each launch adds 1 to the
+        elements of a small buffer the closure owns.
+    """
+    # pylint: disable=import-outside-toplevel
+    import numpy as np
+
+    import tvm_tirx
+    from tvm_tirx.script import ir as I
+    from tvm_tirx.script import tirx as T
+    from tvm_tirx.target import Target
+
+    n = _SEPARATOR_SIZE
+
+    @I.ir_module
+    class Separator:
+        @T.function
+        def main(A: T.Tensor((n,), "float32")):
+            with T.launch_thread("blockIdx.x", 1) as _:
+                with T.launch_thread("threadIdx.x", n) as tx:
+                    A[tx] = A[tx] + T.float32(1)
+
+    fun = tvm_tirx.compile(Separator, target=target or Target.from_device(device))["main"]
+    buffer = tvm_tirx.runtime.tensor(np.zeros(n, np.float32), device)
+
+    def launch():
+        fun(buffer)
+
+    launch.buffer = buffer
+    return launch
